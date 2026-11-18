@@ -220,3 +220,39 @@ func TestUpdateCheck(t *testing.T) {
 	}
 	click(t, d, "打开发布页")
 }
+
+// TestCloseButton checks the close button hides the window on macOS-style
+// runs, and asks before quitting elsewhere while the server runs.
+func TestCloseButton(t *testing.T) {
+	m, d, _ := openApp(t)
+
+	// macOS: hide, never close.
+	hidden, allowed := false, false
+	m.closeHides, m.hide = true, func() { hidden = true }
+	m.onCloseRequest(func() { allowed = true })
+	if !hidden || allowed {
+		t.Fatalf("mac close: hidden=%v allowed=%v, want hidden only", hidden, allowed)
+	}
+
+	// Windows-style, server stopped: close at once.
+	m.closeHides, allowed = false, false
+	m.onCloseRequest(func() { allowed = true })
+	if !allowed {
+		t.Fatal("close with server stopped should allow at once")
+	}
+
+	// Windows-style, server running: ask first.
+	click(t, d, "启动服务")
+	waitFor(t, d, "运行中")
+	allowed = false
+	m.onCloseRequest(func() { allowed = true })
+	if allowed || !m.closeOpen {
+		t.Fatalf("close with server running should ask: allowed=%v open=%v", allowed, m.closeOpen)
+	}
+	if err := d.Paint(); err != nil {
+		t.Fatal(err)
+	}
+	if !shows(d, "退出 GenImage MCP？") {
+		t.Error("confirmation dialog not shown")
+	}
+}

@@ -11,6 +11,7 @@ package gui
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -73,10 +74,22 @@ type model struct {
 	confirmDeleteOpen bool
 	closeOpen         bool
 	closeAllow        func()
+
+	// closeHides makes the window's close button hide the window instead of
+	// quitting (macOS convention); hide does it. Run sets both on macOS.
+	closeHides bool
+	hide       func()
 }
 
-// Run opens the window and blocks until it closes. When autostart is set the
-// MCP server is started before the window appears.
+// Run opens the window and blocks until the application quits. When autostart
+// is set the MCP server is started before the window appears.
+//
+// On macOS the app behaves like other Mac apps: the window's close button (or
+// Cmd+W) only hides the window while the app — and the MCP server — keep
+// running; clicking the Dock icon or opening the app again shows the window;
+// Quit from the Dock menu or the app menu (Cmd+Q) stops the server and exits.
+// On Windows closing the window quits, after a confirmation while the server
+// runs.
 //
 // core supplies configuration and services; the caller closes it afterwards.
 func Run(core *appcore.Core) error {
@@ -85,8 +98,35 @@ func Run(core *appcore.Core) error {
 	if core.Loaded().Effective.Update.CheckOnStartup {
 		m.checkUpdate(false)
 	}
-	var canvas gfx.Canvas
-	return app.RunCanvas(m.windowConfig(true), &canvas)
+	m.closeHides = runtime.GOOS == "darwin"
+	return app.RunApplication(func(a *app.Application) error {
+		canvas := new(gfx.Canvas)
+		win, err := a.OpenWindow(m.windowConfig(true), canvas)
+		if err != nil {
+			return err
+		}
+		m.hide = win.Hide
+		a.OnReopen(win.Show)
+		a.OnQuitRequest(func(quit func()) { m.quitApp(a, quit) })
+		return nil
+	})
+}
+
+// quitApp handles Quit from the Dock or the app menu: it stops the MCP server
+// gracefully in the background (giving in-flight requests up to three
+// seconds), then quits on the event-loop thread. quit closes every window
+// without consulting their close handlers, so a hidden window does not block it.
+//
+// a is the running application; quit is the allow callback from OnQuitRequest.
+func (m *model) quitApp(a *app.Application, quit func()) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.core.Manager.Stop(ctx); err != nil {
+			m.core.Log.Warn("stop server on quit", "error", err.Error())
+		}
+		a.Post(quit)
+	}()
 }
 
 // newModel builds the window state over core and subscribes to server and log
@@ -212,9 +252,17 @@ func (m *model) saveDraft() bool {
 	return true
 }
 
-// onCloseRequest asks for confirmation when the MCP server is running, since
-// closing the window stops it; otherwise the window closes at once.
+// onCloseRequest handles the window's close button. On macOS it hides the
+// window and leaves the app and the MCP server running in the background.
+// Elsewhere closing quits, so it asks for confirmation while the server runs
+// and closes at once otherwise.
+//
+// allow closes the window (and, as the only window, ends the app).
 func (m *model) onCloseRequest(allow func()) {
+	if m.closeHides && m.hide != nil {
+		m.hide()
+		return
+	}
 	if !m.core.Manager.Running() {
 		allow()
 		return

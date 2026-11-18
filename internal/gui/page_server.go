@@ -65,6 +65,9 @@ func (m *model) serverPage(c ui.C) {
 			if m.status.LastError != "" {
 				ui.Paragraph(c, m.status.LastError, 4).Color(theme.Danger)
 			}
+			if m.closeHides {
+				ui.Paragraph(c, "关闭窗口后应用会在后台继续运行，MCP 服务不中断；点 Dock 图标可重新打开窗口，从 Dock 右键或菜单栏选择「退出」才会停止服务并退出。", 3).Muted().FontSize(theme.Metrics.FontSizeS)
+			}
 			if m.core.NeedsRestart() {
 				ui.Row(c).FillWidth().Gap(8).Items(ui.Center).Children(func() {
 					badge(c, toneWarning, "待重启")
