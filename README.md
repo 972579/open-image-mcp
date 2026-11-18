@@ -206,3 +206,9 @@ internal/logx           日志（文件 + 环形缓冲 + 脱敏）
 internal/appcore        服务装配
 internal/gui            viva 界面
 ```
+
+## 许可证
+
+本项目以 [MIT 许可证](LICENSE) 发布。
+
+发布的安装包静态链接了以下第三方库，它们各自遵循自己的许可证：[viva](https://github.com/vivaui/viva)（Apache-2.0）、[MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk)、[jsonschema-go](https://github.com/google/jsonschema-go)、[go-yaml](https://github.com/yaml/go-yaml)、[golang.org/x/image](https://pkg.go.dev/golang.org/x/image) 等，完整列表见 `go.mod`。
