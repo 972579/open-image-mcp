@@ -1,0 +1,15 @@
+# viva build / viva package 的打包配置
+[app]
+name = "GenImage MCP"            # 菜单栏名称，同时是 .app 名称
+id = "local.genimage.mcp"        # bundle identifier
+version = "1.0.0"
+executable = "genimage"
+package = "."                    # main 包
+icon = "assets/icon.png"
+
+[build]
+out = "build"
+
+[mac]
+min_system = "13.0"            # Go 1.27 的目标文件要求 macOS 13
+category = "public.app-category.developer-tools"

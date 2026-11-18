@@ -1,0 +1,57 @@
+# GenImage MCP 配置示例
+# 默认位置：~/.gen-openai-image/config.yaml（应用保存时权限为 0600）
+# 优先级：环境变量 > 配置文件 > 启动参数 > 内置默认值
+version: 1
+
+server:
+  host: 127.0.0.1          # 只监听本机；改为 0.0.0.0 等非回环地址时必须设置 auth_token
+  port: 8765
+  path: /mcp               # MCP 端点：http://127.0.0.1:8765/mcp
+  auth_token: ""           # 为空则不校验；设置后客户端需带 Authorization: Bearer <token>
+  autostart: false         # 打开 App 时自动启动 MCP 服务
+
+defaults:
+  model: gpt-image-2       # 工具调用未指定 model 时使用
+  size: 1024x1024
+  n: 1
+  output_dir: ~/Pictures/gen-openai-image   # 按日期分子目录保存
+  filename_prefix: img
+  include_preview: true    # 工具结果是否附带缩略图（ImageContent，JPEG）
+  preview_max_px: 512
+
+request:
+  timeout: 180s            # 单次上游请求超时
+  max_retries: 1           # 仅对网络错误、429、5xx 重试（指数退避）
+  fallback: true           # 失败后切换到下一个提供同名模型的服务商（鉴权失败 / 参数错误不回退）
+
+update:
+  check_on_startup: true   # 启动时访问 GitHub Releases 检查新版本（只读取公开版本信息）
+
+providers:
+  # SiliconFlow：size→image_size、n→batch_size，响应为 images[].url（会立即下载保存）
+  - name: siliconflow
+    dialect: siliconflow
+    base_url: https://api.siliconflow.cn/v1
+    api_key: ${SILICONFLOW_API_KEY}          # 支持 ${ENV} 引用，也可直接写 sk-xxx
+    enabled: true
+    models:
+      - Qwen/Qwen-Image                      # 简写：只支持生成
+      - id: Qwen/Qwen-Image-Edit
+        generate: false
+        edit: true
+
+  # new-api / one-api 等 OpenAI 兼容中转
+  - name: my-newapi
+    dialect: openai
+    base_url: https://xxx/v1                 # 必须包含 /v1
+    api_key: sk-xxx
+    headers:                                 # 可选：附加请求头
+      X-Custom: foo
+    extra_body: {}                           # 可选：合并进每次请求体
+    models:
+      - id: gpt-image-2
+        edit: true
+        sizes: [1024x1024, 1536x1024, 1024x1536, auto]
+      - id: flux-dev
+        extra:                               # 可选：只对该模型生效的请求体字段
+          num_inference_steps: 28
