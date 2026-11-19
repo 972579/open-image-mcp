@@ -285,6 +285,20 @@ func TestUpdateCheck(t *testing.T) {
 	click(t, d, "在浏览器中下载") // a non-GitHub test URL: blocked with a toast
 	click(t, d, "重试更新")
 	waitFor(t, d, "正在安装 v9.9.9")
+	// The page says 正在安装 before the background goroutine calls the
+	// installer, so wait for the call itself.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		mu.Lock()
+		n := len(installed)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("installer called %d times, want 2", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
