@@ -4,7 +4,7 @@
 package version
 
 // Version is the running build's version, without the leading "v".
-const Version = "1.1.1"
+const Version = "1.1.2"
 
 // Repo is the GitHub repository ("owner/name") whose releases the update
 // check reads.
