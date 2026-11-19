@@ -1,9 +1,14 @@
-// Package update checks GitHub Releases for a newer version of the app.
+// Package update keeps the app up to date from its GitHub Releases.
 //
-// It only reads public release metadata from api.github.com: the request
-// carries a generic User-Agent with the app version and nothing about the
-// user or their configuration. Downloading and installing stay manual: the
-// GUI opens the release asset or page in the browser.
+// The decision and the download come from the signed update feed (feed.go):
+// latest.json and its Ed25519 signature, published with every release by
+// scripts/release.sh. The app trusts only a feed signed with the key whose
+// public half is in PublicKeys, and installs only an archive whose size and
+// SHA-256 the feed lists. This file reads the release notes shown next to an
+// update from the public GitHub API; they are decoration, never trusted.
+//
+// Nothing is sent about the user or their configuration: the requests carry a
+// generic User-Agent with the app version.
 package update
 
 import (
@@ -12,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -20,14 +24,8 @@ import (
 // APIBase is the GitHub API root; tests point it at a fake server.
 var APIBase = "https://api.github.com"
 
-// Asset is one downloadable file of a release.
-type Asset struct {
-	Name string
-	URL  string // browser download URL
-	Size int64
-}
-
-// Release is the latest published (non-draft, non-prerelease) release.
+// Release is the latest published (non-draft, non-prerelease) GitHub release,
+// as far as the about page needs it.
 type Release struct {
 	Tag       string // e.g. "v1.2.0"
 	Version   string // tag without the leading "v"
@@ -35,15 +33,17 @@ type Release struct {
 	Notes     string // release body (Markdown)
 	URL       string // release page
 	Published time.Time
-	Assets    []Asset
 }
 
-// Latest fetches the latest release of repo ("owner/name").
+// Latest fetches the latest GitHub release of repo ("owner/name"), for its
+// release notes. It makes one GET request to the public API and changes
+// nothing locally.
 //
 // ctx bounds the request; client may be nil for a default client with a
 // 15-second timeout; current is the running version, sent only in the
-// User-Agent. It returns an error with a readable message on network
-// failures, rate limiting (HTTP 403/429) or when the repo has no release yet.
+// User-Agent. It returns the release, or an error with a readable message on
+// network failures, rate limiting (HTTP 403/429) or when the repo has no
+// release yet.
 func Latest(ctx context.Context, client *http.Client, repo, current string) (*Release, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
@@ -75,86 +75,12 @@ func Latest(ctx context.Context, client *http.Client, repo, current string) (*Re
 		Body        string    `json:"body"`
 		HTMLURL     string    `json:"html_url"`
 		PublishedAt time.Time `json:"published_at"`
-		Assets      []struct {
-			Name string `json:"name"`
-			URL  string `json:"browser_download_url"`
-			Size int64  `json:"size"`
-		} `json:"assets"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("无法解析 GitHub 返回的版本信息：%v", err)
 	}
-	r := &Release{
+	return &Release{
 		Tag: raw.TagName, Version: strings.TrimPrefix(raw.TagName, "v"), Name: raw.Name,
 		Notes: raw.Body, URL: raw.HTMLURL, Published: raw.PublishedAt,
-	}
-	for _, a := range raw.Assets {
-		r.Assets = append(r.Assets, Asset{Name: a.Name, URL: a.URL, Size: a.Size})
-	}
-	return r, nil
-}
-
-// Newer reports whether version a is newer than b. Both are dotted numbers
-// with an optional leading "v" and optional "-suffix"; a version with a
-// suffix (a pre-release) is older than the same version without one.
-// Unparseable versions never count as newer.
-func Newer(a, b string) bool {
-	pa, sa, okA := parse(a)
-	pb, sb, okB := parse(b)
-	if !okA || !okB {
-		return false
-	}
-	for i := 0; i < 3; i++ {
-		if pa[i] != pb[i] {
-			return pa[i] > pb[i]
-		}
-	}
-	return sa == "" && sb != ""
-}
-
-// parse splits "v1.2.3-rc1" into [1 2 3] and "rc1".
-func parse(v string) ([3]int, string, bool) {
-	var out [3]int
-	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
-	v, suffix, _ := strings.Cut(v, "-")
-	v, _, _ = strings.Cut(v, "+")
-	parts := strings.Split(v, ".")
-	if len(parts) == 0 || len(parts) > 3 {
-		return out, "", false
-	}
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 {
-			return out, "", false
-		}
-		out[i] = n
-	}
-	return out, suffix, true
-}
-
-// AssetFor picks the download for a platform. On macOS it prefers the .dmg
-// for the CPU architecture, then a .zip; on Windows it prefers a setup .exe,
-// then a .zip. It returns nil when the release ships nothing for the platform.
-//
-// goos and goarch are runtime.GOOS and runtime.GOARCH values.
-func (r *Release) AssetFor(goos, goarch string) *Asset {
-	var prefer []string
-	switch goos {
-	case "darwin":
-		prefer = []string{".dmg", ".zip"}
-	case "windows":
-		prefer = []string{"setup.exe", ".zip", ".exe"}
-	default:
-		prefer = []string{".tar.gz", ".zip"}
-	}
-	platform := goos + "-" + goarch
-	for _, ext := range prefer {
-		for i := range r.Assets {
-			name := strings.ToLower(r.Assets[i].Name)
-			if strings.Contains(name, platform) && strings.HasSuffix(name, ext) {
-				return &r.Assets[i]
-			}
-		}
-	}
-	return nil
+	}, nil
 }

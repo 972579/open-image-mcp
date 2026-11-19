@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +13,14 @@ import (
 
 // Record is one line of history.jsonl: an image this app saved.
 type Record struct {
-	ID            string    `json:"id"`
-	Path          string    `json:"path"`
+	ID string `json:"id"`
+	// Path is the file the gallery shows and deletes: the copy in the gallery
+	// directory, or the only file when the image was saved there.
+	Path string `json:"path"`
+	// OutputPath is the file saved where the caller asked (an MCP output_dir
+	// other than the gallery directory), kept apart from the gallery copy and
+	// never deleted by the gallery. Empty when there is no separate copy.
+	OutputPath    string    `json:"output_path,omitempty"`
 	Kind          string    `json:"kind"`
 	Source        string    `json:"source"`
 	Prompt        string    `json:"prompt"`
@@ -26,6 +33,56 @@ type Record struct {
 	Bytes         int       `json:"bytes,omitempty"`
 	MIME          string    `json:"mime,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+// ErrNotFound reports a history record that does not exist (any more).
+var ErrNotFound = errors.New("图库中没有这张图片，可能已被删除")
+
+// Delete removes the image with id from the gallery: it rewrites the history
+// without that record (via a temp file and rename, keeping every other line
+// byte for byte, malformed ones included) and then deletes the record's Path,
+// the gallery's file. The copy at OutputPath, saved where an MCP caller asked,
+// is never touched. A gallery file that is already gone is not an error.
+//
+// id is Record.ID. It returns the deleted record, ErrNotFound when no record
+// has that id, or an error when the history cannot be rewritten (then nothing
+// was deleted) or the file cannot be removed (then the record is already gone).
+func (s *Store) Delete(id string) (Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.historyPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return Record{}, ErrNotFound
+	}
+	if err != nil {
+		return Record{}, err
+	}
+	var kept []byte
+	var removed *Record
+	for _, line := range strings.SplitAfter(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var r Record
+		if removed == nil && json.Unmarshal([]byte(line), &r) == nil && r.ID == id && id != "" {
+			removed = &r
+			continue
+		}
+		if !strings.HasSuffix(line, "\n") {
+			line += "\n"
+		}
+		kept = append(kept, line...)
+	}
+	if removed == nil {
+		return Record{}, ErrNotFound
+	}
+	if err := writeFileAtomic(s.historyPath, kept, 0o600); err != nil {
+		return Record{}, fmt.Errorf("更新历史记录失败: %w", err)
+	}
+	if err := os.Remove(removed.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return *removed, fmt.Errorf("已从图库移除，但删除文件失败: %w", err)
+	}
+	return *removed, nil
 }
 
 // Query filters the history listing. Zero values mean "no filter".
@@ -97,7 +154,7 @@ func (s *Store) List(q Query) (int, []Record, error) {
 		if !q.Since.IsZero() && r.CreatedAt.Before(q.Since) {
 			continue
 		}
-		if kw != "" && !strings.Contains(strings.ToLower(r.Prompt+"\n"+r.Model+"\n"+r.Provider+"\n"+r.Path), kw) {
+		if kw != "" && !strings.Contains(strings.ToLower(r.Prompt+"\n"+r.Model+"\n"+r.Provider+"\n"+r.Path+"\n"+r.OutputPath), kw) {
 			continue
 		}
 		matched = append(matched, r)

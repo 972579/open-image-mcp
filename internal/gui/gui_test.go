@@ -1,14 +1,17 @@
 package gui
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 
 	"github.com/972579/open-image-mcp/internal/appcore"
 	"github.com/972579/open-image-mcp/internal/config"
+	"github.com/972579/open-image-mcp/internal/engine"
 	"github.com/972579/open-image-mcp/internal/mcpserver"
 	"github.com/972579/open-image-mcp/internal/testutil"
 	"github.com/972579/open-image-mcp/internal/update"
@@ -195,20 +199,77 @@ func freePort(t *testing.T) int {
 	return ln.Addr().(*net.TCPAddr).Port
 }
 
-// TestUpdateCheck checks the about page finds a newer release from a fake
-// GitHub API and offers the download for this platform.
+// TestGalleryPreviewAndDelete generates one image the way an MCP call with its
+// own output_dir does, then in the gallery: clicking the thumbnail opens the
+// preview with the whole prompt, and deleting (after confirming) removes the
+// gallery copy and the record but keeps the file in output_dir.
+func TestGalleryPreviewAndDelete(t *testing.T) {
+	m, d, _ := openApp(t)
+	prompt := strings.Repeat("一只戴着围巾的橘猫坐在雪地里，背景是黄昏的小镇和远处的灯光，", 4) + "结尾标记XYZ"
+	outDir := filepath.Join(t.TempDir(), "project")
+	res, err := m.core.Engine.Generate(context.Background(), engine.GenerateRequest{Prompt: prompt, OutputDir: outDir, Source: "mcp"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := res.Images[0]
+	if img.GalleryPath == "" {
+		t.Fatal("no gallery copy kept")
+	}
+
+	click(t, d, "图库")
+	waitFor(t, d, "共 1 张")
+	click(t, d, "预览 "+filepath.Base(img.GalleryPath))
+	waitFor(t, d, "结尾标记XYZ") // the card shows two lines; only the preview shows the end
+	if !shows(d, "指定保存路径") || !shows(d, "复制提示词") {
+		t.Error("preview misses the output path or the copy-prompt button")
+	}
+
+	click(t, d, "删除")
+	waitFor(t, d, "删除这张图片？")
+	click(t, d, "删除图片")
+	waitFor(t, d, "还没有图片")
+	if _, err := os.Stat(img.GalleryPath); !os.IsNotExist(err) {
+		t.Errorf("gallery copy still on disk: %v", err)
+	}
+	if _, err := os.Stat(img.Path); err != nil {
+		t.Errorf("output_dir copy was deleted: %v", err)
+	}
+}
+
+// TestUpdateCheck walks the in-app update against a fake signed feed and a
+// fake GitHub API: the about page finds the newer release with its notes,
+// downloads the archive the feed lists, and hands it to the installer. The
+// first install fails, which must leave the app running with the error, a
+// retry and the browser fallback; the retry installs the same verified file.
 func TestUpdateCheck(t *testing.T) {
+	archive := bytes.Repeat([]byte("new version "), 30000)
+	feed := testutil.NewFeed(update.AppID, "9.9.9", archive)
+	defer feed.Close()
+	oldURL, oldKeys, oldClient := update.FeedURL, update.PublicKeys, update.HTTPClient
+	update.FeedURL, update.PublicKeys, update.HTTPClient = feed.URL(), []string{feed.PublicKey}, feed.Client()
+	defer func() { update.FeedURL, update.PublicKeys, update.HTTPClient = oldURL, oldKeys, oldClient }()
+
 	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		asset := fmt.Sprintf("genimage-9.9.9-%s-%s.zip", runtime.GOOS, runtime.GOARCH)
-		fmt.Fprintf(w, `{"tag_name":"v9.9.9","name":"9.9.9","body":"- 新功能 A\n- 修复 B","html_url":"https://github.com/o/r/releases/tag/v9.9.9","published_at":"2026-12-01T00:00:00Z",
-		"assets":[{"name":%q,"browser_download_url":"https://github.com/o/r/releases/download/v9.9.9/%s","size":1048576}]}`, asset, asset)
+		fmt.Fprint(w, `{"tag_name":"v9.9.9","name":"9.9.9","body":"- 新功能 A\n- 修复 B","html_url":"https://github.com/o/r/releases/tag/v9.9.9","published_at":"2026-12-01T00:00:00Z"}`)
 	}))
 	defer gh.Close()
-	old := update.APIBase
+	oldAPI := update.APIBase
 	update.APIBase = gh.URL
-	defer func() { update.APIBase = old }()
+	defer func() { update.APIBase = oldAPI }()
 
-	_, d, _ := openApp(t)
+	m, d, _ := openApp(t)
+	var mu sync.Mutex
+	var installed []string
+	m.install = func(artifact string, u *update.Update, quit func()) error {
+		mu.Lock()
+		defer mu.Unlock()
+		installed = append(installed, artifact)
+		if len(installed) == 1 {
+			return errors.New("无法替换当前应用（测试）")
+		}
+		return nil
+	}
+
 	click(t, d, "关于")
 	click(t, d, "检查更新")
 	waitFor(t, d, "新版本 v9.9.9")
@@ -218,7 +279,28 @@ func TestUpdateCheck(t *testing.T) {
 	if !shows(d, "有新版本 v9.9.9") {
 		t.Error("sidebar badge missing")
 	}
-	click(t, d, "打开发布页")
+
+	click(t, d, updateButtonLabel(m.upd.avail, false))
+	waitFor(t, d, "无法替换当前应用（测试）")
+	click(t, d, "在浏览器中下载") // a non-GitHub test URL: blocked with a toast
+	click(t, d, "重试更新")
+	waitFor(t, d, "正在安装 v9.9.9")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(installed) != 2 || installed[0] != installed[1] {
+		t.Fatalf("installed = %q", installed)
+	}
+	got, err := os.ReadFile(installed[1])
+	if err != nil || !bytes.Equal(got, archive) {
+		t.Fatalf("installed archive: %d bytes, err %v", len(got), err)
+	}
+	if !strings.HasPrefix(installed[1], filepath.Join(config.HomeDir(), "updates", "9.9.9")) {
+		t.Errorf("archive downloaded to %s", installed[1])
+	}
+	if feed.Downloads() != 1 {
+		t.Errorf("archive requested %d times; the retry should reuse the verified file", feed.Downloads())
+	}
 }
 
 // TestCloseButton checks the close button hides the window on macOS-style

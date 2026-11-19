@@ -5,12 +5,20 @@ GenImage MCP 是一个可自托管的桌面应用（macOS / Windows），界面�
 - 和 Cherry Studio 一样，服务商与模型是解耦的：每个服务商单独配置 base_url、API Key 和模型列表，调用时按模型自动找到对应的服务商。
 - 支持 OpenAI、new-api、one-api 等中转，以及 SiliconFlow 的非标准格式（通过 `dialect` 选择）。
 - 生成的图片保存在本机，工具结果返回绝对路径和缩略图预览，后续工具可以直接引用这个路径。
-- 自带调试台，可以直接测试生图和改图。图库页列出所有历史图片。
+- 自带调试台，可以直接测试生图和改图。图库页列出所有历史图片，可以预览大图、查看提示词和删除图片；MCP 把图片保存到其他目录时，图库也会保留一份。
 - 「关于」页可以检查更新：有新版本时提示，并直接给出本平台安装包的下载按钮。
 
 ## 下载安装
 
-到 [Releases](https://github.com/972579/open-image-mcp/releases/latest) 下载对应平台的文件：
+**macOS 推荐用 Homebrew 安装**：
+
+```bash
+brew install --cask 972579/tap/genimage-mcp
+```
+
+用 Homebrew 安装后，第一次打开不会被 Gatekeeper 拦截：cask 装好后会清除下载标记（应用是 ad-hoc 签名，没有经过 Apple 公证）。之后的版本由应用内更新完成，`brew upgrade` 默认跳过它（加 `--greedy` 才会升级）。卸载用 `brew uninstall --cask genimage-mcp`，加 `--zap` 会一并删除 `~/.gen-openai-image` 里的配置和历史记录（图片目录不会删除）。
+
+也可以到 [Releases](https://github.com/972579/open-image-mcp/releases/latest) 下载对应平台的文件：
 
 | 平台 | 文件 |
 |---|---|
@@ -21,17 +29,24 @@ GenImage MCP 是一个可自托管的桌面应用（macOS / Windows），界面�
 
 `SHA256SUMS.txt` 里有每个文件的校验值。
 
-**macOS**（需要 macOS 13 及以上）：打开 .dmg，把 GenImage MCP 拖进「应用程序」。安装包没有签名，第一次打开时 macOS 会拦截，请右键点应用选择「打开」，或者执行：
+**macOS**（需要 macOS 13 及以上）：打开 .dmg，把 GenImage MCP 拖进「应用程序」。安装包是 ad-hoc 签名，没有经过 Apple 公证，第一次打开时 macOS 会提示「无法验证开发者」。点「完成」后打开「系统设置 → 隐私与安全性」，在页面下方点「仍要打开」并确认即可（macOS 15 起右键「打开」已经不能绕过这个提示）。也可以在终端执行：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/GenImage MCP.app"
 ```
 
+只有第一次安装需要这一步：之后的版本由应用内更新直接下载安装，不会再被拦截。
+
 **Windows**：解压 zip，双击 `genimage.exe`。安装包没有签名，SmartScreen 弹出提示时点「更多信息 → 仍要运行」。Windows 版由 viva 的实验性 Windows 后端构建，遇到问题欢迎提 Issue。
 
 ### 检查更新
 
-「关于」页有「检查更新」按钮，默认在启动时也会自动检查一次（可在同一页关闭，对应配置 `update.check_on_startup`）。检查时只访问 `api.github.com` 读取本仓库公开的最新版本信息，不发送任何配置或个人数据。发现新版本后，可以直接下载本平台的安装包，或打开发布页。下载后先退出应用再安装；配置、历史和图片都保存在用户目录，升级不会丢失。
+「关于」页有「检查更新」按钮，默认在启动时也会自动检查一次（可在同一页关闭，对应配置 `update.check_on_startup`）。发现新版本后点「下载并更新」：应用会在内部下载安装包，校验后自动退出、替换自己并重新打开，MCP 服务会中断几秒。配置、历史和图片都保存在用户目录，升级不会丢失。
+
+- 更新信息来自每个 Release 附带的 `latest.json`，它用 Ed25519 私钥签名，应用只信任内置公钥能验证的版本；安装包的大小和 SHA-256 必须与其中记录的一致，macOS 上还会检查新版本的代码签名和 bundle id。发布说明从 `api.github.com` 读取，只用于展示。检查时不发送任何配置或个人数据。
+- 下载中断或取消后再次更新会从断点继续；下载文件放在 `~/.gen-openai-image/updates`，新版本启动后自动清理。
+- 应用需要放在可写的位置（例如「应用程序」文件夹）才能替换自己。直接从 .dmg 或「下载」文件夹里运行时，macOS 会把应用放到只读的临时位置，这时会提示先移到「应用程序」，并提供浏览器下载作为备选。
+- Windows 目前发布的是免安装 zip，应用不能自动替换，发现新版本后会在浏览器中下载 zip。
 
 ### 从源码构建
 
@@ -146,6 +161,10 @@ claude mcp add --transport http gen-image http://127.0.0.1:8765/mcp
 
 返回内容包括三部分：一段文字说明（列出每张图的绝对路径）、最多 4 张 ≤512px 的 JPEG 预览，以及 `structuredContent`（含 `images[].path`、尺寸、模型、服务商、耗时、每次尝试的记录）。
 
+**保存位置与图库**：不传 `output_dir` 时，图片保存在默认图片目录（设置页的「图片目录」，默认 `~/Pictures/gen-openai-image`）。传了 `output_dir` 时，图片保存到该目录（`images[].path`），默认图片目录里也会保留一份同名副本（`images[].gallery_path`）。这样即使项目里的文件被移走或删除，图库里也还能看到所有生成过的图片。`list_generated_images` 返回的 `path` 是图库里的那份，`output_path` 是当时指定目录里的那份。
+
+**图库页**：点缩略图打开大图预览，右侧显示完整的提示词（以及服务商改写后的提示词），可以一键复制。预览里的「删除」会在确认后移除这条记录并删除图库里的图片文件（不进废纸篓）。指定 `output_dir` 时保存在那个目录里的文件不会被删除。
+
 ## 兼容性
 
 | dialect | 生成 | 编辑 | 响应 |
@@ -187,7 +206,11 @@ viva dev .             # 热重载开发
 scripts/release.sh
 ```
 
-脚本会跑测试，构建 macOS（arm64 / amd64）和 Windows（amd64 / arm64）安装包，生成 `SHA256SUMS.txt`，并用 `gh` 创建 GitHub Release。如果存在 `build/RELEASE_NOTES.md`，会用它作为更新说明。加 `--dry-run` 只构建不发布。
+脚本会跑测试，构建 macOS（arm64 / amd64）和 Windows（amd64 / arm64）安装包，生成签名的更新源 `latest.json` / `latest.json.sig` 和 `SHA256SUMS.txt`，并用 `gh` 创建 GitHub Release。如果存在 `build/RELEASE_NOTES.md`，会用它作为更新说明。加 `--dry-run` 只构建不发布。
+
+- **更新源签名密钥**：`latest.json` 用 Ed25519 私钥签名，公钥写在 `internal/update/feed.go` 的 `PublicKeys`。私钥默认读 `~/.genimage-release/update.key`（可用 `GENIMAGE_UPDATE_KEY_FILE` 指定文件，或用 `VIVA_UPDATE_KEY` 直接传入密钥内容），**不要提交到仓库，并妥善备份**：丢失后已安装的版本将无法再验证新的更新。需要换密钥时，用 `viva update-keygen` 生成新密钥，把新公钥加进 `PublicKeys` 先发布一个版本（仍用旧私钥签名），之后再换用新私钥签名。
+- **macOS 签名**：默认 ad-hoc 签名。设置 `APPLE_SIGNING_IDENTITY`（Developer ID Application 证书）后改用正式签名；再设置 `APPLE_NOTARY_PROFILE`（`xcrun notarytool store-credentials` 创建）时还会自动公证，首次安装也不会再有提示。
+- **Homebrew tap**：`scripts/brew-cask.sh` 根据本次构建的两个 macOS zip 生成 `build/genimage-mcp.rb`。发布成功后，脚本会把它提交到 `972579/homebrew-tap` 仓库的 `Casks/genimage-mcp.rb`（可用 `GENIMAGE_TAP_REPO` 改成别的仓库）。这个仓库不存在时只给出提示，不影响发布。cask 使用 Homebrew 5 起的写法（`postflight_steps`），已在 Homebrew 7 上验证过 `brew style` 和实际安装。
 
 目录结构：
 
@@ -200,7 +223,7 @@ internal/storage        图片落盘、history.jsonl、缩略图
 internal/engine         重试 / 回退 / 保存：GUI 调试台与 MCP 工具共用
 internal/mcpserver      4 个 MCP 工具、Streamable HTTP 启停、Token 鉴权
 internal/clientcfg      各客户端配置片段（按 macOS / Windows 生成路径）
-internal/update         通过 GitHub Releases 检查更新
+internal/update         签名更新源：检查、下载、校验并替换应用
 internal/version        版本号与仓库地址
 internal/logx           日志（文件 + 环形缓冲 + 脱敏）
 internal/appcore        服务装配

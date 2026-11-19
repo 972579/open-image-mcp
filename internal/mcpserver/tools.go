@@ -40,7 +40,7 @@ type GenerateInput struct {
 	OutputFormat   string         `json:"output_format,omitempty" jsonschema:"输出格式（gpt-image）：png、jpeg 或 webp"`
 	Background     string         `json:"background,omitempty" jsonschema:"背景（gpt-image）：transparent、opaque 或 auto"`
 	NegativePrompt string         `json:"negative_prompt,omitempty" jsonschema:"反向提示词（SiliconFlow 等支持）"`
-	OutputDir      string         `json:"output_dir,omitempty" jsonschema:"保存目录（绝对路径），留空使用默认目录"`
+	OutputDir      string         `json:"output_dir,omitempty" jsonschema:"保存目录（绝对路径），留空保存到默认图片目录；指定其他目录时，默认图片目录（图库）里也会保留一份副本"`
 	FilenamePrefix string         `json:"filename_prefix,omitempty" jsonschema:"文件名前缀"`
 	IncludePreview *bool          `json:"include_preview,omitempty" jsonschema:"是否在结果中附带缩略图预览，默认按配置"`
 	Extra          map[string]any `json:"extra,omitempty" jsonschema:"原样合并进上游请求体的额外参数（各家私有参数兜底）"`
@@ -60,7 +60,7 @@ type EditInput struct {
 	ResponseFormat string         `json:"response_format,omitempty" jsonschema:"url 或 b64_json；默认不发送"`
 	OutputFormat   string         `json:"output_format,omitempty" jsonschema:"输出格式：png、jpeg 或 webp"`
 	Background     string         `json:"background,omitempty" jsonschema:"背景：transparent、opaque 或 auto"`
-	OutputDir      string         `json:"output_dir,omitempty" jsonschema:"保存目录（绝对路径）"`
+	OutputDir      string         `json:"output_dir,omitempty" jsonschema:"保存目录（绝对路径），留空保存到默认图片目录；指定其他目录时图库里也会保留一份副本"`
 	FilenamePrefix string         `json:"filename_prefix,omitempty" jsonschema:"文件名前缀"`
 	IncludePreview *bool          `json:"include_preview,omitempty" jsonschema:"是否附带缩略图预览"`
 	Extra          map[string]any `json:"extra,omitempty" jsonschema:"额外上游参数"`
@@ -68,7 +68,8 @@ type EditInput struct {
 
 // ImageOut is one saved image in a tool result.
 type ImageOut struct {
-	Path          string `json:"path" jsonschema:"图片的本机绝对路径，可传给 edit_image 或其他工具"`
+	Path          string `json:"path" jsonschema:"图片的本机绝对路径（在 output_dir 中），可传给 edit_image 或其他工具"`
+	GalleryPath   string `json:"gallery_path,omitempty" jsonschema:"指定了 output_dir 时，图库（默认图片目录）中保留的副本路径"`
 	Width         int    `json:"width"`
 	Height        int    `json:"height"`
 	Bytes         int    `json:"bytes"`
@@ -119,17 +120,18 @@ type ListImagesInput struct {
 
 // ImageRecordOut is one history entry in list_generated_images.
 type ImageRecordOut struct {
-	Path      string `json:"path"`
-	Prompt    string `json:"prompt"`
-	Model     string `json:"model"`
-	Provider  string `json:"provider"`
-	Kind      string `json:"kind"`
-	Size      string `json:"size,omitempty"`
-	Width     int    `json:"width,omitempty"`
-	Height    int    `json:"height,omitempty"`
-	Exists    bool   `json:"exists" jsonschema:"文件当前是否仍在磁盘上"`
-	CreatedAt string `json:"created_at"`
-	Source    string `json:"source"`
+	Path       string `json:"path" jsonschema:"图库中的图片路径"`
+	OutputPath string `json:"output_path,omitempty" jsonschema:"生成时指定了 output_dir 的话，保存在该目录中的那一份"`
+	Prompt     string `json:"prompt"`
+	Model      string `json:"model"`
+	Provider   string `json:"provider"`
+	Kind       string `json:"kind"`
+	Size       string `json:"size,omitempty"`
+	Width      int    `json:"width,omitempty"`
+	Height     int    `json:"height,omitempty"`
+	Exists     bool   `json:"exists" jsonschema:"文件当前是否仍在磁盘上"`
+	CreatedAt  string `json:"created_at"`
+	Source     string `json:"source"`
 }
 
 // ListImagesOutput is list_generated_images' result.
@@ -260,7 +262,7 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 		for _, r := range recs {
 			_, statErr := os.Stat(r.Path)
 			out.Items = append(out.Items, ImageRecordOut{
-				Path: r.Path, Prompt: r.Prompt, Model: r.Model, Provider: r.Provider, Kind: r.Kind,
+				Path: r.Path, OutputPath: r.OutputPath, Prompt: r.Prompt, Model: r.Model, Provider: r.Provider, Kind: r.Kind,
 				Size: r.Size, Width: r.Width, Height: r.Height, Exists: statErr == nil,
 				CreatedAt: r.CreatedAt.Format(time.RFC3339), Source: r.Source,
 			})
@@ -324,7 +326,8 @@ func previewWanted(eng *engine.Engine, v *bool) bool {
 }
 
 // imageResult builds the tool result: a text summary listing every absolute
-// path, up to four JPEG previews, and the structured output.
+// path (and how many gallery copies were kept when output_dir pointed
+// elsewhere), up to four JPEG previews, and the structured output.
 //
 // res is the engine result; preview says whether to attach previews; maxPx is
 // the preview's longer side.
@@ -336,12 +339,19 @@ func imageResult(res *engine.Result, preview bool, maxPx int) (*mcp.CallToolResu
 	var b strings.Builder
 	fmt.Fprintf(&b, "已生成 %d 张图片（模型 %s，服务商 %s，耗时 %.1fs）：\n", len(res.Images), res.Model, res.Provider, res.Elapsed.Seconds())
 	content := []mcp.Content{}
+	copies := 0
 	for i, img := range res.Images {
 		out.Images = append(out.Images, ImageOut{
-			Path: img.Path, Width: img.Width, Height: img.Height, Bytes: img.Bytes, MIME: img.MIME,
+			Path: img.Path, GalleryPath: img.GalleryPath, Width: img.Width, Height: img.Height, Bytes: img.Bytes, MIME: img.MIME,
 			SourceURL: img.SourceURL, RevisedPrompt: img.RevisedPrompt,
 		})
 		fmt.Fprintf(&b, "%d. %s (%dx%d)\n", i+1, img.Path, img.Width, img.Height)
+		if img.GalleryPath != "" {
+			copies++
+		}
+	}
+	if copies > 0 {
+		fmt.Fprintf(&b, "图库（默认图片目录）中也保留了 %d 份副本，见 gallery_path。\n", copies)
 	}
 	if res.RevisedPrompt != "" {
 		fmt.Fprintf(&b, "改写后的提示词：%s\n", res.RevisedPrompt)

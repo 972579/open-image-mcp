@@ -152,6 +152,30 @@ func TestToolsInMemory(t *testing.T) {
 	if li.Total != 2 || !li.Items[0].Exists || li.Items[0].Kind != "edit" {
 		t.Errorf("history: %+v", li)
 	}
+
+	// generate_image into its own output_dir also keeps a gallery copy, and the
+	// history lists the gallery copy with the requested file beside it.
+	custom := filepath.Join(t.TempDir(), "assets")
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "generate_image", Arguments: map[string]any{"prompt": "项目里的图标", "output_dir": custom, "include_preview": false}})
+	if err != nil || res.IsError {
+		t.Fatalf("generate_image with output_dir: %v %+v", err, res.Content)
+	}
+	decode(t, res.StructuredContent, &gen)
+	img := gen.Images[0]
+	if !strings.HasPrefix(img.Path, custom) || img.GalleryPath == "" || strings.HasPrefix(img.GalleryPath, custom) {
+		t.Fatalf("output_dir result: %+v", img)
+	}
+	if text := res.Content[0].(*mcp.TextContent).Text; !strings.Contains(text, "图库") {
+		t.Errorf("summary does not mention the gallery copy: %s", text)
+	}
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_generated_images", Arguments: map[string]any{"keyword": "项目里的图标"}})
+	if err != nil || res.IsError {
+		t.Fatalf("list_generated_images: %v %+v", err, res)
+	}
+	decode(t, res.StructuredContent, &li)
+	if li.Total != 1 || li.Items[0].Path != img.GalleryPath || li.Items[0].OutputPath != img.Path {
+		t.Errorf("history for output_dir image: %+v", li)
+	}
 }
 
 // TestManagerHTTP checks start/stop, the token check, a real Streamable HTTP

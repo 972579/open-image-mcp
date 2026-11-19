@@ -43,8 +43,12 @@ type Meta struct {
 
 // Saved is one image written to disk.
 type Saved struct {
-	ID            string `json:"id"`
-	Path          string `json:"path"`
+	ID   string `json:"id"`
+	Path string `json:"path"` // where the caller asked for it (the output directory)
+	// GalleryPath is the copy kept in the gallery directory when the output
+	// directory is another one; empty when Path is already in the gallery or
+	// the copy could not be written.
+	GalleryPath   string `json:"gallery_path,omitempty"`
 	Width         int    `json:"width"`
 	Height        int    `json:"height"`
 	Bytes         int    `json:"bytes"`
@@ -67,20 +71,31 @@ func New(historyPath string) *Store {
 
 // Save writes each blob under dir/YYYY-MM-DD/ with a name built from prefix,
 // time, model and a random suffix, then appends one history record per image.
-// Files are written via temp file + rename so a crash never leaves half an
-// image behind.
+// When galleryDir is set and is not dir, each image is also copied under
+// galleryDir/YYYY-MM-DD/ with the same name, so the gallery keeps every image
+// even after the file in dir is moved or deleted; the history record then
+// points at the gallery copy (Record.Path) and remembers the requested file
+// (Record.OutputPath). A gallery copy that cannot be written is skipped and
+// the record points at the file in dir instead. Files are written via temp
+// file + rename so a crash never leaves half an image behind.
 //
-// dir must be absolute; prefix is sanitized for file names; meta is recorded
-// in the history. It returns the saved images in order, or the first error
-// (images saved before the error stay on disk and in the history).
-func (s *Store) Save(blobs []Blob, dir, prefix string, meta Meta) ([]Saved, error) {
+// dir must be absolute; galleryDir is absolute or empty (no copy); prefix is
+// sanitized for file names; meta is recorded in the history. It returns the
+// saved images in order, or the first error (images saved before the error
+// stay on disk and in the history).
+func (s *Store) Save(blobs []Blob, dir, galleryDir, prefix string, meta Meta) ([]Saved, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, fmt.Errorf("输出目录必须是绝对路径: %q", dir)
 	}
 	now := s.now()
-	day := filepath.Join(dir, now.Format("2006-01-02"))
+	stamp := now.Format("2006-01-02")
+	day := filepath.Join(dir, stamp)
 	if err := os.MkdirAll(day, 0o755); err != nil {
 		return nil, fmt.Errorf("创建输出目录失败: %w", err)
+	}
+	galleryDay := ""
+	if galleryDir != "" && filepath.IsAbs(galleryDir) && filepath.Clean(galleryDir) != filepath.Clean(dir) {
+		galleryDay = filepath.Join(galleryDir, stamp)
 	}
 	base := fmt.Sprintf("%s_%s_%s_%s", SanitizeName(prefix, "img"), now.Format("20060102-150405"), SanitizeName(meta.Model, "model"), randomHex(3))
 
@@ -90,7 +105,8 @@ func (s *Store) Save(blobs []Blob, dir, prefix string, meta Meta) ([]Saved, erro
 			return out, fmt.Errorf("第 %d 张图片内容为空", i+1)
 		}
 		mime := DetectMIME(b.Data)
-		path := filepath.Join(day, fmt.Sprintf("%s_%02d%s", base, i+1, ExtFor(mime)))
+		name := fmt.Sprintf("%s_%02d%s", base, i+1, ExtFor(mime))
+		path := filepath.Join(day, name)
 		if err := writeAtomic(path, b.Data); err != nil {
 			return out, fmt.Errorf("保存图片失败: %w", err)
 		}
@@ -99,11 +115,20 @@ func (s *Store) Save(blobs []Blob, dir, prefix string, meta Meta) ([]Saved, erro
 			ID: randomHex(8), Path: path, Width: w, Height: h, Bytes: len(b.Data), MIME: mime,
 			SourceURL: b.SourceURL, RevisedPrompt: b.RevisedPrompt,
 		}
+		if galleryDay != "" {
+			copyPath := filepath.Join(galleryDay, name)
+			if os.MkdirAll(galleryDay, 0o755) == nil && writeAtomic(copyPath, b.Data) == nil {
+				saved.GalleryPath = copyPath
+			}
+		}
 		out = append(out, saved)
 		rec := Record{
 			ID: saved.ID, Path: path, Kind: meta.Kind, Source: meta.Source, Prompt: meta.Prompt,
 			RevisedPrompt: b.RevisedPrompt, Model: meta.Model, Provider: meta.Provider, Size: meta.Size,
 			Width: w, Height: h, Bytes: len(b.Data), MIME: mime, CreatedAt: now,
+		}
+		if saved.GalleryPath != "" {
+			rec.Path, rec.OutputPath = saved.GalleryPath, path
 		}
 		if err := s.append(rec); err != nil {
 			return out, fmt.Errorf("写入历史记录失败: %w", err)
@@ -163,10 +188,19 @@ func SanitizeName(s, fallback string) string {
 	return s
 }
 
-// writeAtomic writes data to a temp file in the target directory and renames
-// it into place.
+// writeAtomic writes an image file (mode 0644) via writeFileAtomic.
 func writeAtomic(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".img-*")
+	return writeFileAtomic(path, data, 0o644)
+}
+
+// writeFileAtomic writes data to a temp file in the target directory, sets
+// mode, and renames it into place, so readers see the old file or the new
+// one, never a partial write.
+//
+// path is the final file; data its content; mode its permissions. It returns
+// the first error; the temp file is removed either way.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -176,7 +210,7 @@ func writeAtomic(path string, data []byte) error {
 		tmp.Close()
 		return err
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return err
 	}

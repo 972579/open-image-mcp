@@ -71,6 +71,76 @@ func TestGenerateSavesAndRecords(t *testing.T) {
 	}
 }
 
+// TestOutputDirKeepsGalleryCopy checks an MCP call with its own output_dir
+// saves there and also keeps a copy in the gallery directory, that history
+// points at the gallery copy, and that deleting from the gallery removes only
+// the gallery copy and the record.
+func TestOutputDirKeepsGalleryCopy(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	u.Handler = func(int, testutil.Request) (int, any) { return 200, testutil.B64Response(1) }
+	e, dir := newEngine(t, prov("a", u, "openai", genModel))
+	custom := filepath.Join(dir, "project", "assets")
+
+	res, err := e.Generate(context.Background(), GenerateRequest{Prompt: "海报", OutputDir: custom}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := res.Images[0]
+	if !strings.HasPrefix(img.Path, custom+string(filepath.Separator)) {
+		t.Fatalf("output path %s not under %s", img.Path, custom)
+	}
+	gallery := filepath.Join(dir, "out")
+	if !strings.HasPrefix(img.GalleryPath, gallery+string(filepath.Separator)) || filepath.Base(img.GalleryPath) != filepath.Base(img.Path) {
+		t.Fatalf("gallery copy = %q", img.GalleryPath)
+	}
+	a, errA := os.ReadFile(img.Path)
+	b, errB := os.ReadFile(img.GalleryPath)
+	if errA != nil || errB != nil || string(a) != string(b) {
+		t.Fatalf("copies differ: %v %v", errA, errB)
+	}
+	_, recs, err := e.History(storage.Query{})
+	if err != nil || len(recs) != 1 || recs[0].Path != img.GalleryPath || recs[0].OutputPath != img.Path {
+		t.Fatalf("history = %+v, %v", recs, err)
+	}
+
+	if _, err := e.DeleteImage(recs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(img.GalleryPath); !os.IsNotExist(err) {
+		t.Errorf("gallery copy still there: %v", err)
+	}
+	if _, err := os.Stat(img.Path); err != nil {
+		t.Errorf("output copy must be kept: %v", err)
+	}
+	if total, _, _ := e.History(storage.Query{}); total != 0 {
+		t.Errorf("history still has %d records", total)
+	}
+	if _, err := e.DeleteImage(recs[0].ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("second delete: %v", err)
+	}
+}
+
+// TestDefaultDirHasNoCopy checks a call without output_dir saves only into
+// the gallery directory.
+func TestDefaultDirHasNoCopy(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	u.Handler = func(int, testutil.Request) (int, any) { return 200, testutil.B64Response(1) }
+	e, dir := newEngine(t, prov("a", u, "openai", genModel))
+	res, err := e.Generate(context.Background(), GenerateRequest{Prompt: "猫"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img := res.Images[0]; img.GalleryPath != "" || !strings.HasPrefix(img.Path, filepath.Join(dir, "out")) {
+		t.Fatalf("image = %+v", img)
+	}
+	_, recs, _ := e.History(storage.Query{})
+	if len(recs) != 1 || recs[0].OutputPath != "" || recs[0].Path != res.Images[0].Path {
+		t.Fatalf("history = %+v", recs)
+	}
+}
+
 // TestRetryThenSuccess checks a 500 is retried on the same provider.
 func TestRetryThenSuccess(t *testing.T) {
 	u := testutil.NewUpstream()

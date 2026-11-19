@@ -23,6 +23,8 @@ import (
 	"github.com/972579/open-image-mcp/internal/appcore"
 	"github.com/972579/open-image-mcp/internal/config"
 	"github.com/972579/open-image-mcp/internal/mcpserver"
+	"github.com/972579/open-image-mcp/internal/update"
+	"github.com/972579/open-image-mcp/internal/version"
 )
 
 // Page names, also the sidebar labels.
@@ -79,6 +81,12 @@ type model struct {
 	// quitting (macOS convention); hide does it. Run sets both on macOS.
 	closeHides bool
 	hide       func()
+
+	// app is the running application, set by Run; nil in tests. The in-app
+	// update quits through it and draws download progress on its icon.
+	app *app.Application
+	// install installs a downloaded update (update.Install); tests replace it.
+	install installFunc
 }
 
 // Run opens the window and blocks until the application quits. When autostart
@@ -91,10 +99,16 @@ type model struct {
 // On Windows closing the window quits, after a confirmation while the server
 // runs.
 //
+// At startup it also deletes update downloads that are installed or older, and
+// checks for updates when update.check_on_startup is set. An in-app update
+// ends the app through the Application kept in m.app.
+//
 // core supplies configuration and services; the caller closes it afterwards.
 func Run(core *appcore.Core) error {
 	m := newModel(core)
 	m.autostart()
+	// The archive of the version now running (just installed) is not needed any more.
+	go update.Cleanup(updatesDir(), version.Version)
 	if core.Loaded().Effective.Update.CheckOnStartup {
 		m.checkUpdate(false)
 	}
@@ -105,7 +119,7 @@ func Run(core *appcore.Core) error {
 		if err != nil {
 			return err
 		}
-		m.hide = win.Hide
+		m.hide, m.app = win.Hide, a
 		a.OnReopen(win.Show)
 		a.OnQuitRequest(func(quit func()) { m.quitApp(a, quit) })
 		return nil
@@ -130,9 +144,10 @@ func (m *model) quitApp(a *app.Application, quit func()) {
 }
 
 // newModel builds the window state over core and subscribes to server and log
-// changes so background events repaint the window.
+// changes so background events repaint the window. Updates install with
+// update.Install unless a test replaces m.install.
 func newModel(core *appcore.Core) *model {
-	m := &model{core: core, inv: new(app.Invalidator), tab: tabServer}
+	m := &model{core: core, inv: new(app.Invalidator), tab: tabServer, install: update.Install}
 	m.thumbs = newThumbCache(m.post)
 	m.resetDraft()
 	m.pg.init()

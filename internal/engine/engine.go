@@ -205,6 +205,19 @@ func (e *Engine) History(q storage.Query) (int, []storage.Record, error) {
 	return e.store.List(q)
 }
 
+// DeleteImage removes one image from the gallery: its history record and the
+// gallery's file. A copy saved to an MCP output_dir elsewhere is kept.
+//
+// id is the history record's ID. It returns the deleted record, or
+// storage.ErrNotFound or a file error (see storage.Store.Delete).
+func (e *Engine) DeleteImage(id string) (storage.Record, error) {
+	rec, err := e.store.Delete(id)
+	if err == nil {
+		e.log.Info("image deleted from gallery", "path", rec.Path)
+	}
+	return rec, err
+}
+
 // prepare fills defaults into req, validates it and builds the upstream
 // parameters. It returns the parameters, the absolute output directory and the
 // file name prefix.
@@ -284,7 +297,7 @@ func (e *Engine) run(ctx context.Context, cfg *config.Config, cands []provider.C
 			if err == nil {
 				attempts = append(attempts, att)
 				report("上游已返回 %d 张图片，正在保存", len(resp.Images))
-				res, serr := e.finish(ctx, cand, target, resp, dir, prefix, meta)
+				res, serr := e.finish(ctx, cand, target, resp, dir, galleryDir(cfg), prefix, meta)
 				if serr != nil {
 					return nil, &Failure{Err: serr, Attempts: attempts, Debug: dbg}
 				}
@@ -324,8 +337,28 @@ func (e *Engine) run(ctx context.Context, cfg *config.Config, cands []provider.C
 	return nil, &Failure{Err: lastErr, Attempts: attempts, Debug: lastDebug}
 }
 
-// finish downloads URL images, saves everything and builds the result.
-func (e *Engine) finish(ctx context.Context, cand provider.Candidate, target imageapi.Target, resp *imageapi.Response, dir, prefix string, meta storage.Meta) (*Result, error) {
+// galleryDir is the gallery's directory: the configured default output
+// directory, absolute and cleaned, or "" when it is not usable.
+//
+// cfg is the configuration the call runs with.
+func galleryDir(cfg *config.Config) string {
+	d := config.ExpandHome(strings.TrimSpace(cfg.Defaults.OutputDir))
+	if !filepath.IsAbs(d) {
+		return ""
+	}
+	return filepath.Clean(d)
+}
+
+// finish downloads URL images, saves everything and builds the result. Images
+// are saved in dir and, when dir is not the gallery directory, also copied to
+// gallery so the gallery keeps the full history; a copy that cannot be
+// written is logged and the call still succeeds.
+//
+// ctx bounds the downloads; cand and target are the provider that answered;
+// resp is its response; dir is the requested output directory; gallery is
+// the gallery directory ("" for no copy); prefix and meta name and describe
+// the files. It returns the result or the first download or save error.
+func (e *Engine) finish(ctx context.Context, cand provider.Candidate, target imageapi.Target, resp *imageapi.Response, dir, gallery, prefix string, meta storage.Meta) (*Result, error) {
 	blobs := make([]storage.Blob, 0, len(resp.Images))
 	revised := ""
 	for i, img := range resp.Images {
@@ -345,9 +378,16 @@ func (e *Engine) finish(ctx context.Context, cand provider.Candidate, target ima
 		blobs = append(blobs, storage.Blob{Data: data, SourceURL: img.URL, RevisedPrompt: img.RevisedPrompt})
 	}
 	meta.Model, meta.Provider = cand.Model.ID, cand.Provider.Name
-	saved, err := e.store.Save(blobs, dir, prefix, meta)
+	saved, err := e.store.Save(blobs, dir, gallery, prefix, meta)
 	if err != nil {
 		return nil, err
+	}
+	if gallery != "" && gallery != dir {
+		for _, s := range saved {
+			if s.GalleryPath == "" {
+				e.log.Warn("gallery copy not written; the gallery shows the output file", "path", s.Path, "gallery", gallery)
+			}
+		}
 	}
 	return &Result{Images: saved, Model: cand.Model.ID, Provider: cand.Provider.Name, RevisedPrompt: revised, Seed: resp.Seed}, nil
 }
