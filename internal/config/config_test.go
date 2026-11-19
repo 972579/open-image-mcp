@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // envMap returns a Getenv backed by a map.
@@ -179,6 +180,30 @@ func TestMaxConcurrency(t *testing.T) {
 	}
 }
 
+// TestMaxWait checks request.max_wait defaults to 50s, that 0 (wait until
+// done) is accepted and kept, and that values below 5s or above an hour are
+// rejected.
+func TestMaxWait(t *testing.T) {
+	c := Default()
+	if got := c.Request.MaxWait.Std(); got != 50*time.Second {
+		t.Fatalf("default max_wait = %v, want 50s", got)
+	}
+	c.Request.MaxWait = 0
+	Normalize(&c)
+	if c.Request.MaxWait != 0 {
+		t.Errorf("Normalize changed max_wait 0 to %v", c.Request.MaxWait.Std())
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("max_wait 0 rejected: %v", err)
+	}
+	for _, bad := range []time.Duration{2 * time.Second, 2 * time.Hour, -time.Second} {
+		c.Request.MaxWait = Duration(bad)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_wait") {
+			t.Errorf("max_wait %v not rejected: %v", bad, err)
+		}
+	}
+}
+
 // TestMask checks secret masking.
 func TestMask(t *testing.T) {
 	cases := map[string]string{
@@ -215,5 +240,8 @@ func TestExampleConfig(t *testing.T) {
 	}
 	if got := loaded.Effective.Request.MaxConcurrency; got != 4 {
 		t.Errorf("example max_concurrency = %d, want 4", got)
+	}
+	if got := loaded.Effective.Request.MaxWait.Std(); got != 50*time.Second {
+		t.Errorf("example max_wait = %v, want 50s", got)
 	}
 }

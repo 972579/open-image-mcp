@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +35,13 @@ type Engine struct {
 	slots *limiter
 	// sleep waits between retries; tests replace it to run instantly.
 	sleep func(ctx context.Context, d time.Duration) error
+
+	// base is the parent context of background jobs; only Close cancels it.
+	base context.Context
+	stop context.CancelFunc
+	// jobs holds running jobs and finished ones until they expire.
+	jobsMu sync.Mutex
+	jobs   map[string]*Job
 }
 
 // New returns an Engine serving cfg, calling upstreams through api and saving
@@ -42,10 +50,14 @@ func New(cfg *config.Config, api *imageapi.Client, store *storage.Store, log *sl
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	e := &Engine{api: api, store: store, log: log, slots: newLimiter(cfg.Request.MaxConcurrency), sleep: sleepCtx}
+	e := &Engine{api: api, store: store, log: log, slots: newLimiter(cfg.Request.MaxConcurrency), sleep: sleepCtx, jobs: map[string]*Job{}}
+	e.base, e.stop = context.WithCancel(context.Background())
 	e.Reload(cfg)
 	return e
 }
+
+// Logger returns the engine's logger, so the MCP layer logs to the same file.
+func (e *Engine) Logger() *slog.Logger { return e.log }
 
 // Config returns the configuration currently in use. Callers must not modify it.
 func (e *Engine) Config() *config.Config { return e.cfg.Load() }
@@ -172,14 +184,14 @@ func (e *Engine) Edit(ctx context.Context, req EditRequest, progress Progress) (
 }
 
 // imageLoader loads one reference image or mask; LoadInputImage is the plain
-// one, and EditBatch passes a caching wrapper so an image shared by several
+// one, and StartEdit passes a caching wrapper so an image shared by several
 // tasks is read once.
 type imageLoader func(src, name string) (imageapi.InputImage, error)
 
 // planEdit validates an image-to-image request against cfg, loads its
 // reference images and mask into memory, and resolves the providers that can
-// edit, without calling any upstream. Edit runs the job at once; EditBatch
-// plans every task first so a missing file or bad task rejects the batch
+// edit, without calling any upstream. Edit runs the job at once; StartEdit
+// plans every task first so a missing file or bad task rejects the whole job
 // before anything is spent.
 //
 // cfg is the configuration the job will run with; req is the caller's request
@@ -226,7 +238,7 @@ func (e *Engine) planEdit(cfg *config.Config, req EditRequest, load imageLoader)
 
 // planGenerate validates a text-to-image request against cfg and resolves its
 // providers, without calling any upstream. Generate runs the job at once;
-// GenerateBatch plans every task first so one bad task rejects the batch
+// StartGenerate plans every task first so one bad task rejects the whole job
 // before anything is spent.
 //
 // cfg is the configuration the job will run with; req is the caller's request
@@ -339,6 +351,10 @@ type job struct {
 // saving never hold a slot. The request timeout starts once the slot is held,
 // so time spent queueing does not count against it.
 //
+// Every way the call can end is logged with its elapsed time, including a
+// cancel while queueing or backing off and a failure after the upstream
+// answered (download or save), so the log alone shows why a call failed.
+//
 // ctx cancels the call (queueing included); j is the planned call; progress
 // receives status updates, including a note when the call has to queue. It
 // returns the result, or a *Failure with every attempt.
@@ -362,14 +378,18 @@ func (e *Engine) run(ctx context.Context, j *job, progress Progress) (*Result, e
 				wait := time.Duration(1<<(try-1)) * time.Second
 				report("%s 第 %d 次重试，%v 后开始", cand.Provider.Name, try, wait)
 				if err := e.sleep(ctx, wait); err != nil {
-					return nil, &Failure{Err: classifyCtx(err), Attempts: attempts, Debug: lastDebug}
+					err = classifyCtx(err)
+					e.logFailure(meta, cand, "backoff", err, time.Since(start))
+					return nil, &Failure{Err: err, Attempts: attempts, Debug: lastDebug}
 				}
 			}
 			err := e.slots.acquire(ctx, func(active, limit int) {
 				report("排队等待并发名额：已有 %d 个上游请求在进行（上限 %d）", active, limit)
 			})
 			if err != nil {
-				return nil, &Failure{Err: classifyCtx(err), Attempts: attempts, Debug: lastDebug}
+				err = classifyCtx(err)
+				e.logFailure(meta, cand, "queue", err, time.Since(start))
+				return nil, &Failure{Err: err, Attempts: attempts, Debug: lastDebug}
 			}
 			report("正在请求 %s / %s", cand.Provider.Name, cand.Model.ID)
 			attemptStart := time.Now()
@@ -384,6 +404,7 @@ func (e *Engine) run(ctx context.Context, j *job, progress Progress) (*Result, e
 				report("上游已返回 %d 张图片，正在保存", len(resp.Images))
 				res, serr := e.finish(ctx, cand, target, resp, dir, galleryDir(cfg), prefix, meta)
 				if serr != nil {
+					e.logFailure(meta, cand, "save", serr, time.Since(start))
 					return nil, &Failure{Err: serr, Attempts: attempts, Debug: dbg}
 				}
 				res.Attempts, res.Debug, res.Elapsed = attempts, dbg, time.Since(start)
@@ -396,7 +417,7 @@ func (e *Engine) run(ctx context.Context, j *job, progress Progress) (*Result, e
 			att.Error = err.Error()
 			attempts = append(attempts, att)
 			lastErr = err
-			e.log.Warn("image call failed", "kind", meta.Kind, "provider", cand.Provider.Name, "model", cand.Model.ID, "error", err.Error())
+			e.logFailure(meta, cand, "upstream", err, time.Since(start))
 			apiErr, ok := imageapi.AsError(err)
 			if !ok || apiErr.Kind == imageapi.KindCanceled {
 				return nil, &Failure{Err: err, Attempts: attempts, Debug: lastDebug}
@@ -420,6 +441,18 @@ func (e *Engine) run(ctx context.Context, j *job, progress Progress) (*Result, e
 		lastErr = fmt.Errorf("%w（共尝试 %d 次，详情见 attempts）", lastErr, len(attempts))
 	}
 	return nil, &Failure{Err: lastErr, Attempts: attempts, Debug: lastDebug}
+}
+
+// logFailure writes the "image call failed" line for every way a call can
+// fail, so cancellations and download/save errors are as visible as upstream
+// errors.
+//
+// meta and cand say which call and provider; stage is where it failed
+// ("upstream", "queue", "backoff" or "save"); err is the error; elapsed is
+// the time since the call started. There is no return value.
+func (e *Engine) logFailure(meta storage.Meta, cand provider.Candidate, stage string, err error, elapsed time.Duration) {
+	e.log.Warn("image call failed", "kind", meta.Kind, "provider", cand.Provider.Name, "model", cand.Model.ID,
+		"stage", stage, "elapsed", elapsed.Round(time.Millisecond), "error", err.Error())
 }
 
 // galleryDir is the gallery's directory: the configured default output

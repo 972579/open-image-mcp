@@ -24,6 +24,8 @@ request:
   max_retries: 1           # 仅对网络错误、429、5xx 重试（指数退避）
   fallback: true           # 失败后切换到下一个提供同名模型的服务商（鉴权失败 / 参数错误不回退）
   max_concurrency: 4       # 同时进行的上游生图请求上限（1-16），所有调用和批量任务共享，超出的排队等待
+  max_wait: 50s            # 工具调用最多等多久就先返回（未完成的在后台继续，用 get_image_job 取结果）；0 表示一直等。
+                           # 不少 MCP 客户端 60 秒会取消请求（官方 TypeScript SDK 的默认值），所以默认 50 秒；客户端超时更长时可以调大或设为 0
 
 update:
   check_on_startup: true   # 启动时访问 GitHub Releases 检查新版本（只读取公开版本信息）

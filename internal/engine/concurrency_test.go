@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/972579/open-image-mcp/internal/config"
+	"github.com/972579/open-image-mcp/internal/imageapi"
 	"github.com/972579/open-image-mcp/internal/storage"
 	"github.com/972579/open-image-mcp/internal/testutil"
 )
@@ -84,17 +85,20 @@ func TestBatchRunsConcurrentlyWithinLimit(t *testing.T) {
 	var mu sync.Mutex
 	var queued bool
 	start := time.Now()
-	items, err := e.GenerateBatch(context.Background(), reqs, func(_ int, msg string) {
+	job, err := e.StartGenerate(reqs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := job.Listen(func(_ int, msg string) {
 		mu.Lock()
 		defer mu.Unlock()
 		if strings.Contains(msg, "排队") {
 			queued = true
 		}
 	})
+	items := waitItems(t, job)
+	stop()
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if got := pt.peak.Load(); got != 3 {
 		t.Errorf("peak concurrent upstream requests = %d, want 3", got)
 	}
@@ -126,10 +130,11 @@ func TestBatchPartialFailure(t *testing.T) {
 	defer u.Close()
 	u.Handler = slowHandler(&peakTracker{}, 0)
 	e, _ := newEngine(t, prov("a", u, "openai", genModel))
-	items, err := e.GenerateBatch(context.Background(), []GenerateRequest{{Prompt: "好图"}, {Prompt: "坏图"}, {Prompt: "另一张好图"}}, nil)
+	job, err := e.StartGenerate([]GenerateRequest{{Prompt: "好图"}, {Prompt: "坏图"}, {Prompt: "另一张好图"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	items := waitItems(t, job)
 	if items[0].Err != nil || items[2].Err != nil {
 		t.Fatalf("good tasks failed: %v / %v", items[0].Err, items[2].Err)
 	}
@@ -145,17 +150,20 @@ func TestBatchValidatesBeforeCalling(t *testing.T) {
 	u := testutil.NewUpstream()
 	defer u.Close()
 	e, _ := newEngine(t, prov("a", u, "openai", genModel))
-	_, err := e.GenerateBatch(context.Background(), []GenerateRequest{{Prompt: "ok"}, {Prompt: "  "}}, nil)
+	_, err := e.StartGenerate([]GenerateRequest{{Prompt: "ok"}, {Prompt: "  "}}, nil)
 	if err == nil || !strings.Contains(err.Error(), "第 2 个任务") {
 		t.Fatalf("want error naming task 2, got %v", err)
+	}
+	if _, err := e.StartGenerate([]GenerateRequest{{Prompt: " "}}, nil); err == nil || strings.Contains(err.Error(), "第 1 个任务") {
+		t.Errorf("a single call's error should not name a task: %v", err)
 	}
 	if n := len(u.Requests()); n != 0 {
 		t.Errorf("upstream got %d requests for a rejected batch", n)
 	}
-	if _, err := e.GenerateBatch(context.Background(), nil, nil); err == nil {
+	if _, err := e.StartGenerate(nil, nil); err == nil {
 		t.Error("empty batch accepted")
 	}
-	if _, err := e.GenerateBatch(context.Background(), make([]GenerateRequest, MaxBatchTasks+1), nil); err == nil {
+	if _, err := e.StartGenerate(make([]GenerateRequest, MaxBatchTasks+1), nil); err == nil {
 		t.Error("oversized batch accepted")
 	}
 }
@@ -189,10 +197,11 @@ func TestEditBatchRunsConcurrentlyWithinLimit(t *testing.T) {
 		src := writePNG(t, dir, "src-"+string(rune('a'+i))+".png")
 		reqs[i] = EditRequest{GenerateRequest: GenerateRequest{Prompt: "批量编辑水彩"}, Images: []string{src}}
 	}
-	items, err := e.EditBatch(context.Background(), reqs, nil)
+	job, err := e.StartEdit(reqs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	items := waitItems(t, job)
 	for i, it := range items {
 		if it.Err != nil || len(it.Result.Images) != 1 {
 			t.Fatalf("task %d: %+v %v", i, it.Result, it.Err)
@@ -228,15 +237,15 @@ func TestEditBatchValidatesBeforeCalling(t *testing.T) {
 	ok := EditRequest{GenerateRequest: GenerateRequest{Prompt: "改"}, Images: []string{src}}
 
 	missing := EditRequest{GenerateRequest: GenerateRequest{Prompt: "改"}, Images: []string{filepath.Join(dir, "nope.png")}}
-	if _, err := e.EditBatch(context.Background(), []EditRequest{ok, missing}, nil); err == nil || !strings.Contains(err.Error(), "第 2 个任务") {
+	if _, err := e.StartEdit([]EditRequest{ok, missing}, nil); err == nil || !strings.Contains(err.Error(), "第 2 个任务") {
 		t.Errorf("missing file: want error naming task 2, got %v", err)
 	}
 	genOnly := ok
 	genOnly.Model = "gen-only"
-	if _, err := e.EditBatch(context.Background(), []EditRequest{genOnly}, nil); err == nil || !strings.Contains(err.Error(), "第 1 个任务") {
-		t.Errorf("generation-only model: want error naming task 1, got %v", err)
+	if _, err := e.StartEdit([]EditRequest{ok, genOnly}, nil); err == nil || !strings.Contains(err.Error(), "第 2 个任务") {
+		t.Errorf("generation-only model: want error naming task 2, got %v", err)
 	}
-	if _, err := e.EditBatch(context.Background(), []EditRequest{{GenerateRequest: GenerateRequest{Prompt: "改"}}}, nil); err == nil {
+	if _, err := e.StartEdit([]EditRequest{{GenerateRequest: GenerateRequest{Prompt: "改"}}}, nil); err == nil {
 		t.Error("task without images accepted")
 	}
 	if n := len(u.Requests()); n != 0 {
@@ -264,6 +273,80 @@ func TestCachedLoaderSharesImages(t *testing.T) {
 	}
 	if _, err := load(src+".missing", "image-1"); err == nil {
 		t.Error("missing file not reported")
+	}
+}
+
+// waitItems waits (up to ten seconds) for job to finish and returns its task
+// outcomes, failing the test on a timeout.
+func waitItems(t *testing.T, job *Job) []BatchItem {
+	t.Helper()
+	if !job.Wait(context.Background(), 10*time.Second) {
+		t.Fatal("job did not finish in 10s")
+	}
+	return job.Snapshot().Items
+}
+
+// TestJobOutlivesWaiter checks a job keeps running after its waiter gives up
+// (the wait budget or a cancelled client request), reports partial state
+// meanwhile, saves its image, and stays retrievable by ID until it expires.
+func TestJobOutlivesWaiter(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	u.Handler = slowHandler(&peakTracker{}, 300*time.Millisecond)
+	e, _ := newEngine(t, prov("a", u, "openai", genModel))
+	job, err := e.StartGenerate([]GenerateRequest{{Prompt: "后台继续"}}, "info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A cancelled waiter returns at once without touching the job.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if job.Wait(ctx, 0) {
+		t.Fatal("job reported done immediately")
+	}
+	if job.Wait(context.Background(), 50*time.Millisecond) {
+		t.Fatal("job done before the upstream answered")
+	}
+	snap := job.Snapshot()
+	if snap.Done || snap.Finished[0] || snap.Progress[0] == "" {
+		t.Errorf("partial snapshot wrong: %+v", snap)
+	}
+	items := waitItems(t, job)
+	if items[0].Err != nil || len(items[0].Result.Images) != 1 {
+		t.Fatalf("job result: %+v %v", items[0].Result, items[0].Err)
+	}
+	if total, _, _ := e.History(storage.Query{Keyword: "后台继续"}); total != 1 {
+		t.Errorf("history has %d images, want 1", total)
+	}
+	got, ok := e.Job(job.ID)
+	if !ok || got != job || got.Info != "info" {
+		t.Fatalf("Job(%s) = %v %v", job.ID, got, ok)
+	}
+	// Expired jobs are pruned on lookup.
+	job.mu.Lock()
+	job.ended = time.Now().Add(-JobRetention - time.Minute)
+	job.mu.Unlock()
+	if _, ok := e.Job(job.ID); ok {
+		t.Error("expired job still listed")
+	}
+}
+
+// TestCloseCancelsJobs checks Engine.Close cancels a running job, which then
+// ends with a cancellation error.
+func TestCloseCancelsJobs(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	u.Handler = slowHandler(&peakTracker{}, 2*time.Second)
+	e, _ := newEngine(t, prov("a", u, "openai", genModel))
+	job, err := e.StartGenerate([]GenerateRequest{{Prompt: "关闭时取消"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	e.Close()
+	items := waitItems(t, job)
+	if apiErr, ok := imageapi.AsError(items[0].Err); !ok || apiErr.Kind != imageapi.KindCanceled {
+		t.Errorf("job after Close: %v, want a cancellation", items[0].Err)
 	}
 }
 

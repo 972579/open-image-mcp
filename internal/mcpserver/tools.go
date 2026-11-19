@@ -4,7 +4,6 @@ package mcpserver
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,9 +31,14 @@ const maxPreviews = 4
 // each successful task, up to this many in all.
 const maxBatchPreviews = 8
 
-// serverInstructions is sent to clients on initialize and steers the model
-// towards the batch tool when it wants several images at once.
-const serverInstructions = "图像生成工具：generate_image 文生图、batch_generate_images 一次提交多个提示词并发生成、edit_image 图生图/编辑、batch_edit_images 一次提交多个编辑任务并发执行、list_models 查看可用模型、list_generated_images 查看历史。需要多张不同内容的图片，或要对多张图分别编辑（或对同一张图做多种编辑）时，优先用 batch_generate_images / batch_edit_images 一次提交，服务端会并发执行，比逐个调用快得多。生成的图片保存在本机，结果中的 path 可直接给后续工具使用。"
+// serverInstructions is sent to clients on initialize. It steers the model
+// towards the batch tools when it wants several images, and explains the
+// running/job_id contract so it fetches unfinished work instead of
+// resubmitting it.
+const serverInstructions = "图像生成工具：generate_image 文生图、batch_generate_images 一次提交多个提示词并发生成、edit_image 图生图/编辑、batch_edit_images 一次提交多个编辑任务并发执行、get_image_job 获取后台任务结果、list_models 查看可用模型、list_generated_images 查看历史。" +
+	"需要多张不同内容的图片，或要对多张图分别编辑（或对同一张图做多种编辑）时，优先用 batch_generate_images / batch_edit_images 一次提交，服务端会并发执行，比逐个调用快得多。" +
+	"生成一张图通常要 30-90 秒；为避免客户端请求超时，每次调用最多等待约 50 秒，没完成时结果的 status 为 running 并带 job_id，任务在后台继续运行——这时不要重新提交，调用 get_image_job 传入 job_id 获取结果即可。" +
+	"生成的图片保存在本机，结果中的 path 可直接给后续工具使用。"
 
 // GenerateInput is generate_image's arguments. Fields without omitempty are
 // required in the inferred JSON schema.
@@ -98,7 +102,11 @@ type AttemptOut struct {
 }
 
 // ImageResult is the structured result of generate_image and edit_image.
+// When the wait budget runs out first, Status is "running", Images is empty
+// and JobID names the background job to pass to get_image_job.
 type ImageResult struct {
+	Status        string       `json:"status" jsonschema:"done：已完成；running：仍在后台运行，用 get_image_job 传入 job_id 获取结果，不要重新提交"`
+	JobID         string       `json:"job_id,omitempty" jsonschema:"status 为 running 时的后台任务 ID"`
 	Images        []ImageOut   `json:"images"`
 	Model         string       `json:"model"`
 	Provider      string       `json:"provider"`
@@ -191,6 +199,7 @@ type BatchItemOut struct {
 	Index         int          `json:"index" jsonschema:"任务在 tasks 中的下标（从 0 开始）"`
 	Prompt        string       `json:"prompt" jsonschema:"该任务实际使用的提示词或编辑指令"`
 	SourceImages  []string     `json:"source_images,omitempty" jsonschema:"编辑任务实际使用的参考图（本机路径；base64 显示为 <base64>）"`
+	Status        string       `json:"status" jsonschema:"succeeded、failed 或 running（仍在后台运行）"`
 	OK            bool         `json:"ok" jsonschema:"该任务是否成功"`
 	Error         string       `json:"error,omitempty" jsonschema:"失败原因"`
 	Images        []ImageOut   `json:"images,omitempty"`
@@ -202,14 +211,18 @@ type BatchItemOut struct {
 	Attempts      []AttemptOut `json:"attempts,omitempty"`
 }
 
-// BatchResult is the structured result of batch_generate_images and
-// batch_edit_images.
+// BatchResult is the structured result of batch_generate_images,
+// batch_edit_images and get_image_job. Status "running" means some tasks
+// are still in the background: pass JobID to get_image_job for the rest.
 type BatchResult struct {
+	Status         string         `json:"status" jsonschema:"done：全部任务已结束；running：部分任务仍在后台运行，用 get_image_job 传入 job_id 获取其余结果，不要重新提交"`
+	JobID          string         `json:"job_id" jsonschema:"后台任务 ID，传给 get_image_job"`
 	Items          []BatchItemOut `json:"items"`
 	Succeeded      int            `json:"succeeded"`
 	Failed         int            `json:"failed"`
+	Running        int            `json:"running" jsonschema:"仍在进行的任务数"`
 	MaxConcurrency int            `json:"max_concurrency" jsonschema:"本次使用的上游并发上限（request.max_concurrency）"`
-	ElapsedMS      int64          `json:"elapsed_ms" jsonschema:"整个批次的耗时"`
+	ElapsedMS      int64          `json:"elapsed_ms" jsonschema:"任务从提交到现在（或到结束）的耗时"`
 }
 
 // ListModelsInput is list_models' arguments.
@@ -255,9 +268,15 @@ type ListImagesOutput struct {
 	Items []ImageRecordOut `json:"items"`
 }
 
-// NewServer builds an MCP server with the six image tools bound to eng.
+// NewServer builds an MCP server with the seven image tools bound to eng.
 // Each tool call reads eng's current configuration, so saving the config in
 // the GUI takes effect without rebuilding the server.
+//
+// The four generating tools start an engine job, wait for it at most
+// request.max_wait and then return either the results or what is done plus a
+// job_id; the job keeps running in the background regardless of the client
+// (even if it cancels), and get_image_job collects the rest. Client
+// cancellations are logged with their reason.
 //
 // onCall, when not nil, is told the tool name each time a tool is invoked (the
 // GUI counts calls with it). It returns an error only if a schema cannot be
@@ -271,6 +290,9 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 			onCall(name)
 		}
 	}
+	w := newWaiter(eng)
+	srv.AddReceivingMiddleware(w.logCancels)
+	maxPx := func() int { return eng.Config().Defaults.PreviewMaxPx }
 
 	genSchema, err := jsonschema.For[GenerateInput](nil)
 	if err != nil {
@@ -280,17 +302,16 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "generate_image",
 		Title:       "生成图片",
-		Description: "根据文字描述调用 OpenAI 兼容的图像接口生成图片，保存到本机并返回绝对路径和缩略图预览。适用于「画一张…」「生成一张…的图片」之类的请求。一次要多张不同提示词的图片时，请改用 batch_generate_images 并发生成。",
+		Description: "根据文字描述调用 OpenAI 兼容的图像接口生成图片，保存到本机并返回绝对路径和缩略图预览。适用于「画一张…」「生成一张…的图片」之类的请求。一次要多张不同提示词的图片时，请改用 batch_generate_images 并发生成。" + runningHint,
 		InputSchema: genSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in GenerateInput) (*mcp.CallToolResult, ImageResult, error) {
 		count("generate_image")
-		stop := startProgress(ctx, req)
-		res, err := eng.Generate(ctx, in.request(), stop.report)
-		stop.done()
+		view := newJobView(true, "生成", []batchTaskInfo{{Prompt: strings.TrimSpace(in.Prompt)}}, previewWanted(eng, in.IncludePreview))
+		job, err := eng.StartGenerate([]engine.GenerateRequest{in.request()}, view)
 		if err != nil {
 			return nil, ImageResult{}, err
 		}
-		return imageResult(res, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
+		return w.singleResult(view, job, w.await(ctx, req, "generate_image", job), maxPx())
 	})
 
 	batchSchema, err := jsonschema.For[BatchGenerateInput](nil)
@@ -310,26 +331,20 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 		Title: "批量并发生成图片",
 		Description: fmt.Sprintf("一次提交多个文生图任务（1-%d 个，每个任务一个 prompt，可分别指定模型、尺寸等），服务端并发生成并等待全部完成，"+
 			"比逐个调用 generate_image 快得多。适用于「画几张不同风格的…」「为每个场景各生成一张图」之类的请求。"+
-			"上游并发数受配置 request.max_concurrency 限制，超出的任务排队。某个任务失败不影响其他任务，结果按任务顺序列出每张图的绝对路径和失败原因。", engine.MaxBatchTasks),
+			"上游并发数受配置 request.max_concurrency 限制，超出的任务排队。某个任务失败不影响其他任务，结果按任务顺序列出每张图的绝对路径和失败原因。"+runningHint, engine.MaxBatchTasks),
 		InputSchema: batchSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in BatchGenerateInput) (*mcp.CallToolResult, BatchResult, error) {
 		count("batch_generate_images")
-		stop := startProgress(ctx, req)
-		start := time.Now()
-		total := len(in.Tasks)
-		items, err := eng.GenerateBatch(ctx, in.requests(), func(i int, msg string) {
-			stop.report(fmt.Sprintf("[任务 %d/%d] %s", i+1, total, msg))
-		})
-		stop.done()
-		if err != nil {
-			return nil, BatchResult{}, err
-		}
 		tasks := make([]batchTaskInfo, len(in.Tasks))
 		for i, t := range in.Tasks {
 			tasks[i] = batchTaskInfo{Prompt: strings.TrimSpace(t.Prompt)}
 		}
-		_, limit := eng.Concurrency()
-		return batchResult("批量生成", tasks, items, time.Since(start), limit, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
+		view := newJobView(false, "批量生成", tasks, previewWanted(eng, in.IncludePreview))
+		job, err := eng.StartGenerate(in.requests(), view)
+		if err != nil {
+			return nil, BatchResult{}, err
+		}
+		return w.jobResult(view, job, w.await(ctx, req, "batch_generate_images", job), view.preview, maxPx())
 	})
 
 	editSchema, err := jsonschema.For[EditInput](nil)
@@ -344,17 +359,17 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "edit_image",
 		Title:       "编辑图片",
-		Description: "以一张或多张参考图为基础按指令编辑/重绘（图生图），需要模型支持编辑。参考图可用本机绝对路径（例如 generate_image 返回的 path）或 base64。要分别编辑多张图、或对同一张图做多种编辑时，请改用 batch_edit_images 并发执行。",
+		Description: "以一张或多张参考图为基础按指令编辑/重绘（图生图），需要模型支持编辑。参考图可用本机绝对路径（例如 generate_image 返回的 path）或 base64。要分别编辑多张图、或对同一张图做多种编辑时，请改用 batch_edit_images 并发执行。" + runningHint,
 		InputSchema: editSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in EditInput) (*mcp.CallToolResult, ImageResult, error) {
 		count("edit_image")
-		stop := startProgress(ctx, req)
-		res, err := eng.Edit(ctx, in.request(), stop.report)
-		stop.done()
+		r := in.request()
+		view := newJobView(true, "编辑", []batchTaskInfo{{Prompt: strings.TrimSpace(r.Prompt), Sources: sourceLabels(r.Images)}}, previewWanted(eng, in.IncludePreview))
+		job, err := eng.StartEdit([]engine.EditRequest{r}, view)
 		if err != nil {
 			return nil, ImageResult{}, err
 		}
-		return imageResult(res, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
+		return w.singleResult(view, job, w.await(ctx, req, "edit_image", job), maxPx())
 	})
 
 	batchEditSchema, err := jsonschema.For[BatchEditInput](nil)
@@ -382,32 +397,24 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 		Description: fmt.Sprintf("一次提交多个图生图/编辑任务（1-%d 个）并发执行，等待全部完成。两种常见用法："+
 			"把同一条指令应用到多张图（填公共 prompt，每个任务只给自己的 images），或对同一张图做多种编辑（填公共 images，每个任务只给自己的 prompt）；"+
 			"任务也可以各自指定 prompt、images、mask、模型、尺寸等。参考图可用本机绝对路径（例如 generate_image 返回的 path）或 base64，需要模型支持编辑。"+
-			"上游并发数受配置 request.max_concurrency 限制，超出的任务排队。执行前会先检查所有任务（缺图、模型不支持编辑等会直接拒绝整批），某个任务执行失败不影响其他任务。", engine.MaxBatchTasks),
+			"上游并发数受配置 request.max_concurrency 限制，超出的任务排队。执行前会先检查所有任务（缺图、模型不支持编辑等会直接拒绝整批），某个任务执行失败不影响其他任务。"+runningHint, engine.MaxBatchTasks),
 		InputSchema: batchEditSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in BatchEditInput) (*mcp.CallToolResult, BatchResult, error) {
 		count("batch_edit_images")
-		stop := startProgress(ctx, req)
-		start := time.Now()
-		total := len(in.Tasks)
 		reqs := in.requests()
-		items, err := eng.EditBatch(ctx, reqs, func(i int, msg string) {
-			stop.report(fmt.Sprintf("[任务 %d/%d] %s", i+1, total, msg))
-		})
-		stop.done()
+		tasks := make([]batchTaskInfo, len(reqs))
+		for i, r := range reqs {
+			tasks[i] = batchTaskInfo{Prompt: strings.TrimSpace(r.Prompt), Sources: sourceLabels(r.Images)}
+		}
+		view := newJobView(false, "批量编辑", tasks, previewWanted(eng, in.IncludePreview))
+		job, err := eng.StartEdit(reqs, view)
 		if err != nil {
 			return nil, BatchResult{}, err
 		}
-		tasks := make([]batchTaskInfo, len(reqs))
-		for i, r := range reqs {
-			srcs := make([]string, len(r.Images))
-			for k, src := range r.Images {
-				srcs[k] = sourceLabel(src)
-			}
-			tasks[i] = batchTaskInfo{Prompt: strings.TrimSpace(r.Prompt), Sources: srcs}
-		}
-		_, limit := eng.Concurrency()
-		return batchResult("批量编辑", tasks, items, time.Since(start), limit, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
+		return w.jobResult(view, job, w.await(ctx, req, "batch_edit_images", job), view.preview, maxPx())
 	})
+
+	addGetJobTool(srv, w, count)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "list_models",
@@ -611,6 +618,17 @@ func sourceLabel(src string) string {
 	}
 }
 
+// sourceLabels applies sourceLabel to every reference image of a task.
+//
+// srcs are the task's images. It returns one display string per image.
+func sourceLabels(srcs []string) []string {
+	out := make([]string, len(srcs))
+	for i, src := range srcs {
+		out[i] = sourceLabel(src)
+	}
+	return out
+}
+
 // mergeExtra returns shared overlaid with task (task keys win), or nil when
 // both are empty. Neither input is modified.
 //
@@ -645,7 +663,7 @@ func previewWanted(eng *engine.Engine, v *bool) bool {
 // the preview's longer side.
 func imageResult(res *engine.Result, preview bool, maxPx int) (*mcp.CallToolResult, ImageResult, error) {
 	out := ImageResult{
-		Model: res.Model, Provider: res.Provider, RevisedPrompt: res.RevisedPrompt, Seed: res.Seed,
+		Status: statusDone, Model: res.Model, Provider: res.Provider, RevisedPrompt: res.RevisedPrompt, Seed: res.Seed,
 		ElapsedMS: res.Elapsed.Milliseconds(),
 	}
 	var b strings.Builder
@@ -686,62 +704,6 @@ func imageResult(res *engine.Result, preview bool, maxPx int) (*mcp.CallToolResu
 type batchTaskInfo struct {
 	Prompt  string
 	Sources []string
-}
-
-// batchResult builds a batch tool result: a text summary with each task's
-// status, reference images (for edits) and output paths (or its error),
-// previews of the first image of each successful task (at most
-// maxBatchPreviews), and the structured output. When every task failed the
-// result is marked IsError so the client treats the call as failed, while
-// still carrying each task's error.
-//
-// title names the batch in the summary ("批量生成" or "批量编辑"); tasks
-// describe each task's input, in task order; items are the engine outcomes in
-// the same order; elapsed is the whole batch's duration; limit is the
-// concurrency limit in force; preview says whether to attach previews; maxPx
-// is the preview's longer side.
-func batchResult(title string, tasks []batchTaskInfo, items []engine.BatchItem, elapsed time.Duration, limit int, preview bool, maxPx int) (*mcp.CallToolResult, BatchResult, error) {
-	out := BatchResult{Items: make([]BatchItemOut, 0, len(items)), MaxConcurrency: limit, ElapsedMS: elapsed.Milliseconds()}
-	var body strings.Builder
-	var previews []mcp.Content
-	for i, it := range items {
-		info := tasks[i]
-		item := BatchItemOut{Index: i, Prompt: info.Prompt, SourceImages: info.Sources, ElapsedMS: it.Elapsed.Milliseconds()}
-		sources := ""
-		if len(info.Sources) > 0 {
-			sources = "    参考图：" + strings.Join(info.Sources, "、") + "\n"
-		}
-		if it.Err != nil {
-			out.Failed++
-			item.Error = it.Err.Error()
-			var f *engine.Failure
-			if errors.As(it.Err, &f) {
-				item.Attempts = attemptsOut(f.Attempts)
-			}
-			fmt.Fprintf(&body, "[%d] 失败（%.1fs）：%s\n    prompt：%s\n%s", i+1, it.Elapsed.Seconds(), item.Error, oneLine(item.Prompt, 60), sources)
-			out.Items = append(out.Items, item)
-			continue
-		}
-		res := it.Result
-		out.Succeeded++
-		item.OK = true
-		item.Model, item.Provider, item.RevisedPrompt, item.Seed = res.Model, res.Provider, res.RevisedPrompt, res.Seed
-		item.Images = imagesOut(res)
-		item.Attempts = attemptsOut(res.Attempts)
-		fmt.Fprintf(&body, "[%d] 成功：%d 张（模型 %s，服务商 %s，%.1fs）prompt：%s\n%s", i+1, len(res.Images), res.Model, res.Provider, it.Elapsed.Seconds(), oneLine(item.Prompt, 60), sources)
-		for _, img := range res.Images {
-			fmt.Fprintf(&body, "    %s (%dx%d)\n", img.Path, img.Width, img.Height)
-		}
-		if preview && len(previews) < maxBatchPreviews && len(res.Images) > 0 {
-			if jpg, ok := previewJPEG(res.Images[0].Path, maxPx); ok {
-				previews = append(previews, jpg)
-			}
-		}
-		out.Items = append(out.Items, item)
-	}
-	head := fmt.Sprintf("%s完成：%d 个任务，成功 %d 个，失败 %d 个（总耗时 %.1fs，上游并发上限 %d）：\n", title, len(items), out.Succeeded, out.Failed, elapsed.Seconds(), limit)
-	content := append([]mcp.Content{&mcp.TextContent{Text: head + body.String()}}, previews...)
-	return &mcp.CallToolResult{Content: content, IsError: out.Succeeded == 0}, out, nil
 }
 
 // imagesOut converts an engine result's saved images into tool output.

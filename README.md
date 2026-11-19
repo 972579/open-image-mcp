@@ -158,10 +158,13 @@ claude mcp add --transport http gen-image http://127.0.0.1:8765/mcp
 | `batch_generate_images` | `tasks` | 批量并发文生图。`tasks` 为 1-16 个任务，每个任务必填 `prompt`，可单独指定 `model`、`size`、`n`、`seed` 等；顶层的同名参数作为所有任务的公共值，`extra` 按键合并（任务优先）。各任务并发执行，某个任务失败不影响其他任务 |
 | `edit_image` | `prompt`、`images` | 图生图/编辑。`images` 可以是绝对路径、data URL 或 base64，最多 16 张。可选 `mask` 以及与生成相同的参数。模型需要在配置中勾选「编辑」 |
 | `batch_edit_images` | `tasks` | 批量并发编辑。`tasks` 为 1-16 个任务，每个任务可以有自己的 `prompt`、`images`(1-16)、`mask` 和与编辑相同的参数；顶层的 `prompt`、`images`、`mask` 等是公共值。常见用法：同一条指令批量处理多张图（顶层 `prompt` + 每个任务的 `images`），或对同一张图做多种编辑（顶层 `images` + 每个任务的 `prompt`）。任务自带 `images` 时只用它自己的 `mask`。执行前先检查所有任务（缺图、模型不支持编辑会直接拒绝整批），同一张参考图只读取一次 |
+| `get_image_job` | `job_id` | 获取在后台继续运行的任务结果。上面四个工具在 `status` 为 `running` 时返回 `job_id`，用它调用本工具继续等待（同样最多等 `request.max_wait`）；完成后返回全部结果，未完成时返回已完成的部分。只读 |
 | `list_models` | — | 列出可用模型、所属服务商以及支持生成还是编辑，可按 `provider`、`capability` 过滤 |
 | `list_generated_images` | — | 按时间倒序列出历史图片，可按 `limit`、`offset`、`model`、`keyword`、`since` 过滤 |
 
 **并发**：服务端会并行处理同时到达的多个工具调用，所有调用（包括批量任务和调试台）共享一个上游并发上限 `request.max_concurrency`（默认 4，设置页「最大并发数」，1-16），超出的请求排队等待，排队时间不计入请求超时。如果客户端是一个接一个地调用工具（不少 Agent 对会写文件的工具都这样做），多次 `generate_image` 仍会串行；要一次出多张不同内容的图，或一次编辑多张图，用 `batch_generate_images` / `batch_edit_images` 一次提交，服务端内部并发执行。批量结果按任务顺序列出每张图的路径和失败原因，附带每个成功任务第一张图的预览（最多 8 张）；全部任务都失败时整个调用标记为错误。
+
+**等待上限与后台任务**：生成一张图通常要 30-90 秒，而不少 MCP 客户端会在 60 秒时取消请求（这是官方 TypeScript SDK 的默认请求超时；经由 `mcp-remote` 接入的 Claude 桌面版实测就是这样）。因此每次调用最多等待 `request.max_wait`（默认 50 秒，设置页「最长等待」）：到时还没完成，就先返回已完成的部分，`status` 为 `running` 并带上 `job_id`，没完成的任务在后台继续运行，用 `get_image_job` 取结果。任务不受客户端影响：即使客户端超时取消了请求，正在生成的图片也会照常保存到图库，不会白白浪费。任务结束后保留 1 小时，App 退出时取消。客户端超时比较长（例如 Claude Code，或调大了 `tool_timeout_sec` 的 Codex）时，可以把「最长等待」调大，或设为 0（一直等到完成）。
 
 返回内容包括三部分：一段文字说明（列出每张图的绝对路径）、最多 4 张 ≤512px 的 JPEG 预览，以及 `structuredContent`（含 `images[].path`、尺寸、模型、服务商、耗时、每次尝试的记录）。
 
@@ -185,7 +188,7 @@ claude mcp add --transport http gen-image http://127.0.0.1:8765/mcp
 - **端口被占用**：到「设置」页换一个端口，然后在「服务」页重启。
 - **[鉴权失败] 401**：检查 API Key，以及 base_url 有没有包含 `/v1`。
 - **[模型不支持]**：确认模型 ID 拼写正确，并且这个服务商确实提供该模型。new-api 返回「无可用渠道」也会被识别为这一类错误，并自动切换到下一个提供同名模型的服务商。
-- **客户端超时**：生图期间服务会持续发送 MCP 进度通知，避免客户端提前断开。Codex 用户可以调大 `tool_timeout_sec`。
+- **客户端超时**：调用超过 `request.max_wait`（默认 50 秒）就会先返回 `job_id`，Agent 用 `get_image_job` 继续取结果，所以一般不会再遇到超时；客户端取消请求时，后台任务也会继续完成并保存图片。日志（`~/.gen-openai-image/logs/app.log`）会记下每次调用来自哪个客户端、有没有带进度 token，以及客户端取消请求的原因。如果客户端自己的超时更短（低于 50 秒），把「最长等待」调到比它小一些。
 - **看实际发了什么请求**：在调试台打开「显示请求 / 响应详情」，里面的密钥和 base64 内容都已脱敏。
 
 ## 安全

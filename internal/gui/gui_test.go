@@ -112,6 +112,34 @@ func waitFor(t *testing.T, d *app.Driver, want string) {
 	}
 }
 
+// TestDebugConsoleFollowsJob checks the debug console's MCP mode still ends
+// with the image when the call outlasts the server's wait budget: the tool
+// returns status running, and the console keeps calling get_image_job until
+// the job is done.
+func TestDebugConsoleFollowsJob(t *testing.T) {
+	m, d, u := openApp(t)
+	u.Handler = func(int, testutil.Request) (int, any) {
+		time.Sleep(400 * time.Millisecond)
+		return 200, testutil.B64Response(1)
+	}
+	cfg := m.core.Engine.Config().Clone()
+	cfg.Request.MaxWait = config.Duration(100 * time.Millisecond)
+	m.core.Engine.Reload(&cfg)
+
+	click(t, d, "启动服务")
+	waitFor(t, d, "运行中")
+	click(t, d, "调试台")
+	click(t, d, viaMCP)
+	click(t, d, "生成图片")
+	waitFor(t, d, "（经由 MCP）")
+	if m.pg.result == nil || len(m.pg.result.images) != 1 {
+		t.Fatalf("debug result: %+v", m.pg.result)
+	}
+	if !strings.Contains(strings.Join(m.pg.result.debug, "\n"), "get_image_job") {
+		t.Errorf("transcript does not show the get_image_job rounds:\n%s", strings.Join(m.pg.result.debug, "\n"))
+	}
+}
+
 // TestDesktopFlow walks the main user path: start the server, test the
 // provider, read client configs, generate in the debug console via MCP, and
 // find the image in the gallery.

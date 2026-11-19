@@ -162,7 +162,9 @@ func (m *Manager) Start(sc config.ServerConfig) error {
 }
 
 // Stop shuts the server down gracefully, waiting up to five seconds for
-// in-flight requests (a running image generation is cancelled after that).
+// in-flight requests. Image jobs started by tool calls belong to the engine
+// and keep running; their results land in the gallery and can still be
+// fetched with get_image_job after the server is started again.
 //
 // ctx bounds the wait. It returns nil when the server was not running.
 func (m *Manager) Stop(ctx context.Context) error {

@@ -19,7 +19,7 @@ import (
 func (m *model) serverPage(c ui.C) {
 	theme := c.Theme()
 	eff := m.core.Loaded().Effective
-	scaffold(c, "MCP 服务", "以 Streamable HTTP 方式对外提供 generate_image / batch_generate_images / edit_image / batch_edit_images / list_models / list_generated_images 六个工具。", func() {
+	scaffold(c, "MCP 服务", "以 Streamable HTTP 方式对外提供 generate_image / batch_generate_images / edit_image / batch_edit_images / get_image_job / list_models / list_generated_images 七个工具。", func() {
 		card(c, "", func() {
 			ui.Row(c).FillWidth().Gap(12).Items(ui.Center).Children(func() {
 				statusDot(c, m.status.State)

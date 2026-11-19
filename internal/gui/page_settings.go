@@ -25,6 +25,8 @@ type settingsForm struct {
 	// concurrency is request.max_concurrency, the shared cap on upstream
 	// requests in flight.
 	concurrency string
+	// maxWait is request.max_wait in seconds (0 = wait until done).
+	maxWait string
 }
 
 // newSettingsForm fills the form from the draft.
@@ -36,6 +38,7 @@ func newSettingsForm(c *config.Config) settingsForm {
 		previewPx: strconv.Itoa(c.Defaults.PreviewMaxPx),
 		timeout:   strconv.Itoa(int(c.Request.Timeout.Std().Seconds())), retries: strconv.Itoa(c.Request.MaxRetries),
 		concurrency: strconv.Itoa(c.Request.MaxConcurrency),
+		maxWait:     strconv.Itoa(int(c.Request.MaxWait.Std().Seconds())),
 	}
 }
 
@@ -74,6 +77,12 @@ func (f *settingsForm) apply(c *config.Config) error {
 	if c.Request.MaxConcurrency, err = num("最大并发数", f.concurrency, 1, config.MaxConcurrencyLimit); err != nil {
 		return err
 	}
+	lo, hi := int(config.MinMaxWait.Seconds()), int(config.MaxWaitLimit.Seconds())
+	wait, err := strconv.Atoi(strings.TrimSpace(f.maxWait))
+	if err != nil || wait < 0 || (wait > 0 && wait < lo) || wait > hi {
+		return fmt.Errorf("最长等待（秒）必须为 0 或 %d-%d 之间的整数", lo, hi)
+	}
+	c.Request.MaxWait = config.Duration(time.Duration(wait) * time.Second)
 	c.Server.Host = strings.TrimSpace(f.host)
 	c.Server.Path = strings.TrimSpace(f.path)
 	c.Defaults.Model = strings.TrimSpace(f.model)
@@ -153,11 +162,18 @@ func (m *model) settingsPage(c ui.C) {
 						ui.TextField(c, &f.retries, "重试次数", "1").FillWidth()
 					})
 				})
-				// Shared cap on in-flight upstream requests; the engine applies a
-				// saved change at once, queued calls included.
+			})
+			// Second row: concurrency cap and tool wait budget. Both apply to the
+			// next tool call after saving, without restarting the server.
+			ui.Row(c).FillWidth().Gap(16).Children(func() {
 				ui.Column(c).Grow(1).Children(func() {
 					field(c, "最大并发数", fmt.Sprintf("同时进行的上游请求上限（1-%d），所有调用和批量任务共享，超出的排队。", config.MaxConcurrencyLimit), func() {
 						ui.TextField(c, &f.concurrency, "最大并发数", "4").FillWidth()
+					})
+				})
+				ui.Column(c).Grow(1).Children(func() {
+					field(c, "最长等待（秒）", "工具调用最多等这么久就先返回 job_id，未完成的在后台继续。不少客户端 60 秒超时，默认 50；0 表示一直等。", func() {
+						ui.TextField(c, &f.maxWait, "最长等待", "50").FillWidth()
 					})
 				})
 			})

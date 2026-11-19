@@ -475,7 +475,9 @@ func debugLines(d imageapi.Debug, attempts []engine.Attempt) []string {
 
 // callViaMCP connects to the running local MCP endpoint with the official
 // client, calls the tool and parses its structured result: a true end-to-end
-// check of what Claude or Codex would see.
+// check of what Claude or Codex would see. When the call outlasts the
+// server's wait budget and returns status "running", it keeps calling
+// get_image_job with the job_id until the job is done, as an agent would.
 func (m *model) callViaMCP(ctx context.Context, st mcpserver.Status, mode string, req engine.EditRequest, progress engine.Progress, id int) *pgResult {
 	client := mcp.NewClient(&mcp.Implementation{Name: "genimage-debug", Version: mcpserver.Version}, &mcp.ClientOptions{
 		ProgressNotificationHandler: func(_ context.Context, r *mcp.ProgressNotificationClientRequest) {
@@ -558,6 +560,13 @@ func (m *model) callViaMCP(ctx context.Context, st mcpserver.Status, mode string
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return &pgResult{err: "无法解析 structuredContent: " + err.Error(), debug: debug}
 	}
+	if out.Status == "running" {
+		var errText string
+		out, debug, errText = m.followJob(ctx, cs, out.JobID, progress, id, debug)
+		if errText != "" {
+			return &pgResult{err: errText, debug: debug}
+		}
+	}
 	pretty, _ := json.MarshalIndent(out, "", "  ")
 	debug = append(debug, " ", "── structuredContent ──")
 	debug = append(debug, splitLines(string(pretty))...)
@@ -568,6 +577,55 @@ func (m *model) callViaMCP(ctx context.Context, st mcpserver.Status, mode string
 	return &pgResult{
 		images: saved, debug: debug,
 		summary: fmt.Sprintf("%d 张 · %s · %s · 服务端耗时 %.1fs（经由 MCP）", len(saved), out.Model, out.Provider, float64(out.ElapsedMS)/1000),
+	}
+}
+
+// followJob polls get_image_job until the job started by a tool call that
+// returned status "running" is done, appending each round to debug, and
+// converts the job's single task into the ImageResult the tool would have
+// returned had it finished in time.
+//
+// ctx cancels the polling (the debug console's cancel button); cs is the
+// connected MCP session; jobID is from the running result; progress shows
+// status; id makes the progress tokens unique; debug is the transcript so
+// far. It returns the final result, the extended transcript, and an error
+// text ("" on success) for a failed task or call.
+func (m *model) followJob(ctx context.Context, cs *mcp.ClientSession, jobID string, progress engine.Progress, id int, debug []string) (mcpserver.ImageResult, []string, string) {
+	for round := 1; ; round++ {
+		progress(fmt.Sprintf("[MCP] 服务端仍在后台生成，第 %d 次调用 get_image_job（%s）", round, jobID))
+		params := &mcp.CallToolParams{Name: "get_image_job", Arguments: map[string]any{"job_id": jobID, "include_preview": false}}
+		params.SetProgressToken(fmt.Sprintf("debug-%d-job-%d", id, round))
+		res, err := cs.CallTool(ctx, params)
+		if err != nil {
+			return mcpserver.ImageResult{}, debug, "get_image_job 调用失败: " + err.Error()
+		}
+		var text strings.Builder
+		for _, ct := range res.Content {
+			if v, ok := ct.(*mcp.TextContent); ok {
+				text.WriteString(v.Text)
+			}
+		}
+		debug = append(debug, " ", fmt.Sprintf("── get_image_job 第 %d 次 ──", round))
+		debug = append(debug, splitLines(text.String())...)
+		var br mcpserver.BatchResult
+		raw, _ := json.Marshal(res.StructuredContent)
+		if err := json.Unmarshal(raw, &br); err != nil {
+			return mcpserver.ImageResult{}, debug, "无法解析 get_image_job 的 structuredContent: " + err.Error()
+		}
+		if br.Status == "running" {
+			continue
+		}
+		if len(br.Items) == 0 {
+			return mcpserver.ImageResult{}, debug, "get_image_job 没有返回任务结果"
+		}
+		it := br.Items[0]
+		if !it.OK {
+			return mcpserver.ImageResult{}, debug, it.Error
+		}
+		return mcpserver.ImageResult{
+			Status: "done", Images: it.Images, Model: it.Model, Provider: it.Provider,
+			RevisedPrompt: it.RevisedPrompt, Seed: it.Seed, ElapsedMS: br.ElapsedMS, Attempts: it.Attempts,
+		}, debug, ""
 	}
 }
 

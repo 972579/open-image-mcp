@@ -116,13 +116,16 @@ func (c *Core) RestartServer() error {
 	return c.Manager.Restart(ctx, c.Loaded().Effective.Server)
 }
 
-// Close stops the server and closes the log file.
+// Close stops the server, cancels the engine's background image jobs (work
+// still running is lost; images already saved stay in the gallery) and closes
+// the log file. There is no return value.
 func (c *Core) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	if err := c.Manager.Stop(ctx); err != nil {
 		c.Log.Warn("stop server", "error", err.Error())
 	}
+	c.Engine.Close()
 	if c.logCloser != nil {
 		_ = c.logCloser.Close()
 	}

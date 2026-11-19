@@ -75,7 +75,20 @@ type RequestConfig struct {
 	// requests wait for a free slot. Retries and fallbacks each take a slot
 	// only while their request is in flight.
 	MaxConcurrency int `yaml:"max_concurrency"`
+	// MaxWait is how long an image tool call waits for its result before
+	// returning what is done plus a job_id; unfinished work keeps running in
+	// the background and is fetched with get_image_job. It keeps calls under
+	// MCP clients' own request timeouts (60s by default in the official
+	// TypeScript SDK). 0 waits until everything is done.
+	MaxWait Duration `yaml:"max_wait"`
 }
+
+// MaxWaitLimit is the longest request.max_wait accepted; MinMaxWait is the
+// shortest non-zero one.
+const (
+	MaxWaitLimit = time.Hour
+	MinMaxWait   = 5 * time.Second
+)
 
 // MaxConcurrencyLimit is the highest request.max_concurrency accepted.
 const MaxConcurrencyLimit = 16
@@ -211,6 +224,7 @@ func Default() Config {
 			MaxRetries:     1,
 			Fallback:       true,
 			MaxConcurrency: 4,
+			MaxWait:        Duration(50 * time.Second),
 		},
 		Update: UpdateConfig{CheckOnStartup: true},
 	}
@@ -268,6 +282,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Request.MaxConcurrency < 1 || c.Request.MaxConcurrency > MaxConcurrencyLimit {
 		problems = append(problems, fmt.Sprintf("request.max_concurrency 必须在 1-%d 之间", MaxConcurrencyLimit))
+	}
+	if w := c.Request.MaxWait.Std(); w < 0 || (w > 0 && w < MinMaxWait) || w > MaxWaitLimit {
+		problems = append(problems, fmt.Sprintf("request.max_wait 必须为 0（一直等待）或 %v-%v", MinMaxWait, MaxWaitLimit))
 	}
 	seen := map[string]bool{}
 	for i, p := range c.Providers {
