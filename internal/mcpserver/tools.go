@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/972579/open-image-mcp/internal/config"
 	"github.com/972579/open-image-mcp/internal/engine"
 	"github.com/972579/open-image-mcp/internal/provider"
 	"github.com/972579/open-image-mcp/internal/storage"
@@ -32,7 +34,7 @@ const maxBatchPreviews = 8
 
 // serverInstructions is sent to clients on initialize and steers the model
 // towards the batch tool when it wants several images at once.
-const serverInstructions = "图像生成工具：generate_image 文生图、batch_generate_images 一次提交多个提示词并发生成、edit_image 图生图/编辑、list_models 查看可用模型、list_generated_images 查看历史。需要多张不同内容的图片时，优先用 batch_generate_images 一次提交，服务端会并发生成，比逐个调用 generate_image 快得多。生成的图片保存在本机，结果中的 path 可直接给后续工具使用。"
+const serverInstructions = "图像生成工具：generate_image 文生图、batch_generate_images 一次提交多个提示词并发生成、edit_image 图生图/编辑、batch_edit_images 一次提交多个编辑任务并发执行、list_models 查看可用模型、list_generated_images 查看历史。需要多张不同内容的图片，或要对多张图分别编辑（或对同一张图做多种编辑）时，优先用 batch_generate_images / batch_edit_images 一次提交，服务端会并发执行，比逐个调用快得多。生成的图片保存在本机，结果中的 path 可直接给后续工具使用。"
 
 // GenerateInput is generate_image's arguments. Fields without omitempty are
 // required in the inferred JSON schema.
@@ -144,10 +146,51 @@ type BatchGenerateInput struct {
 	Extra          map[string]any   `json:"extra,omitempty" jsonschema:"所有任务共用的额外上游参数"`
 }
 
+// BatchEditTaskInput is one task of batch_edit_images. prompt and images may
+// both be left out to use the batch's shared ones, so one instruction can be
+// applied to many pictures, or many instructions to one picture.
+type BatchEditTaskInput struct {
+	Prompt         string         `json:"prompt,omitempty" jsonschema:"该任务的编辑指令；留空使用公共 prompt"`
+	Images         []string       `json:"images,omitempty" jsonschema:"该任务的参考图（1-16 张）：本机绝对路径、data URL 或 base64；留空使用公共 images，设置后完全替换公共 images"`
+	Mask           string         `json:"mask,omitempty" jsonschema:"该任务的蒙版；任务设置了自己的 images 时只使用这里的蒙版，不沿用公共 mask"`
+	Model          string         `json:"model,omitempty" jsonschema:"该任务使用的支持编辑的模型 ID"`
+	Provider       string         `json:"provider,omitempty" jsonschema:"该任务指定的服务商名称"`
+	Size           string         `json:"size,omitempty" jsonschema:"该任务的输出尺寸"`
+	N              int            `json:"n,omitempty" jsonschema:"该任务生成数量 1-10"`
+	Quality        string         `json:"quality,omitempty" jsonschema:"该任务的画质"`
+	Seed           *int64         `json:"seed,omitempty" jsonschema:"该任务的随机种子"`
+	OutputFormat   string         `json:"output_format,omitempty" jsonschema:"该任务的输出格式"`
+	Background     string         `json:"background,omitempty" jsonschema:"该任务的背景"`
+	FilenamePrefix string         `json:"filename_prefix,omitempty" jsonschema:"该任务的文件名前缀"`
+	Extra          map[string]any `json:"extra,omitempty" jsonschema:"该任务的额外上游参数，与批次的 extra 合并，同名键以任务为准"`
+}
+
+// BatchEditInput is batch_edit_images' arguments: the tasks plus a shared
+// instruction, reference images and parameters for tasks that leave them out.
+type BatchEditInput struct {
+	Tasks          []BatchEditTaskInput `json:"tasks" jsonschema:"要并发执行的编辑任务（1-16 个）；每个任务最终都要有 prompt 和至少一张参考图（自己的或公共的）"`
+	Prompt         string               `json:"prompt,omitempty" jsonschema:"公共编辑指令，用于没有自己 prompt 的任务（例如把同一指令应用到多张图）"`
+	Images         []string             `json:"images,omitempty" jsonschema:"公共参考图（1-16 张），用于没有自己 images 的任务（例如对同一张图做多种编辑）"`
+	Mask           string               `json:"mask,omitempty" jsonschema:"公共蒙版，只用于沿用公共 images 的任务"`
+	Model          string               `json:"model,omitempty" jsonschema:"公共模型 ID（需支持编辑），留空使用默认模型"`
+	Provider       string               `json:"provider,omitempty" jsonschema:"公共服务商名称"`
+	Size           string               `json:"size,omitempty" jsonschema:"公共输出尺寸"`
+	N              int                  `json:"n,omitempty" jsonschema:"每个任务的生成数量 1-10，默认 1"`
+	Quality        string               `json:"quality,omitempty" jsonschema:"公共画质"`
+	ResponseFormat string               `json:"response_format,omitempty" jsonschema:"url 或 b64_json；默认不发送"`
+	OutputFormat   string               `json:"output_format,omitempty" jsonschema:"公共输出格式：png、jpeg 或 webp"`
+	Background     string               `json:"background,omitempty" jsonschema:"公共背景：transparent、opaque 或 auto"`
+	OutputDir      string               `json:"output_dir,omitempty" jsonschema:"保存目录（绝对路径），所有任务共用；留空保存到默认图片目录，指定其他目录时图库里也会保留副本"`
+	FilenamePrefix string               `json:"filename_prefix,omitempty" jsonschema:"公共文件名前缀"`
+	IncludePreview *bool                `json:"include_preview,omitempty" jsonschema:"是否附带缩略图预览（每个成功任务的第一张，最多 8 张），默认按配置"`
+	Extra          map[string]any       `json:"extra,omitempty" jsonschema:"所有任务共用的额外上游参数"`
+}
+
 // BatchItemOut is one task's outcome in a batch result.
 type BatchItemOut struct {
 	Index         int          `json:"index" jsonschema:"任务在 tasks 中的下标（从 0 开始）"`
-	Prompt        string       `json:"prompt"`
+	Prompt        string       `json:"prompt" jsonschema:"该任务实际使用的提示词或编辑指令"`
+	SourceImages  []string     `json:"source_images,omitempty" jsonschema:"编辑任务实际使用的参考图（本机路径；base64 显示为 <base64>）"`
 	OK            bool         `json:"ok" jsonschema:"该任务是否成功"`
 	Error         string       `json:"error,omitempty" jsonschema:"失败原因"`
 	Images        []ImageOut   `json:"images,omitempty"`
@@ -159,7 +202,8 @@ type BatchItemOut struct {
 	Attempts      []AttemptOut `json:"attempts,omitempty"`
 }
 
-// BatchResult is the structured result of batch_generate_images.
+// BatchResult is the structured result of batch_generate_images and
+// batch_edit_images.
 type BatchResult struct {
 	Items          []BatchItemOut `json:"items"`
 	Succeeded      int            `json:"succeeded"`
@@ -211,7 +255,7 @@ type ListImagesOutput struct {
 	Items []ImageRecordOut `json:"items"`
 }
 
-// NewServer builds an MCP server with the five image tools bound to eng.
+// NewServer builds an MCP server with the six image tools bound to eng.
 // Each tool call reads eng's current configuration, so saving the config in
 // the GUI takes effect without rebuilding the server.
 //
@@ -280,8 +324,12 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 		if err != nil {
 			return nil, BatchResult{}, err
 		}
+		tasks := make([]batchTaskInfo, len(in.Tasks))
+		for i, t := range in.Tasks {
+			tasks[i] = batchTaskInfo{Prompt: strings.TrimSpace(t.Prompt)}
+		}
 		_, limit := eng.Concurrency()
-		return batchResult(in, items, time.Since(start), limit, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
+		return batchResult("批量生成", tasks, items, time.Since(start), limit, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
 	})
 
 	editSchema, err := jsonschema.For[EditInput](nil)
@@ -296,7 +344,7 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "edit_image",
 		Title:       "编辑图片",
-		Description: "以一张或多张参考图为基础按指令编辑/重绘（图生图），需要模型支持编辑。参考图可用本机绝对路径（例如 generate_image 返回的 path）或 base64。",
+		Description: "以一张或多张参考图为基础按指令编辑/重绘（图生图），需要模型支持编辑。参考图可用本机绝对路径（例如 generate_image 返回的 path）或 base64。要分别编辑多张图、或对同一张图做多种编辑时，请改用 batch_edit_images 并发执行。",
 		InputSchema: editSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, in EditInput) (*mcp.CallToolResult, ImageResult, error) {
 		count("edit_image")
@@ -307,6 +355,58 @@ func NewServer(eng *engine.Engine, onCall func(tool string)) (*mcp.Server, error
 			return nil, ImageResult{}, err
 		}
 		return imageResult(res, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
+	})
+
+	batchEditSchema, err := jsonschema.For[BatchEditInput](nil)
+	if err != nil {
+		return nil, fmt.Errorf("batch_edit_images schema: %w", err)
+	}
+	setEnums(batchEditSchema)
+	one, sixteen := 1, 16
+	if p := batchEditSchema.Properties["images"]; p != nil {
+		p.MinItems, p.MaxItems = &one, &sixteen
+	}
+	if p := batchEditSchema.Properties["tasks"]; p != nil {
+		most := engine.MaxBatchTasks
+		p.MinItems, p.MaxItems = &one, &most
+		if p.Items != nil {
+			setEnums(p.Items)
+			if ip := p.Items.Properties["images"]; ip != nil {
+				ip.MinItems, ip.MaxItems = &one, &sixteen
+			}
+		}
+	}
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:  "batch_edit_images",
+		Title: "批量并发编辑图片",
+		Description: fmt.Sprintf("一次提交多个图生图/编辑任务（1-%d 个）并发执行，等待全部完成。两种常见用法："+
+			"把同一条指令应用到多张图（填公共 prompt，每个任务只给自己的 images），或对同一张图做多种编辑（填公共 images，每个任务只给自己的 prompt）；"+
+			"任务也可以各自指定 prompt、images、mask、模型、尺寸等。参考图可用本机绝对路径（例如 generate_image 返回的 path）或 base64，需要模型支持编辑。"+
+			"上游并发数受配置 request.max_concurrency 限制，超出的任务排队。执行前会先检查所有任务（缺图、模型不支持编辑等会直接拒绝整批），某个任务执行失败不影响其他任务。", engine.MaxBatchTasks),
+		InputSchema: batchEditSchema,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in BatchEditInput) (*mcp.CallToolResult, BatchResult, error) {
+		count("batch_edit_images")
+		stop := startProgress(ctx, req)
+		start := time.Now()
+		total := len(in.Tasks)
+		reqs := in.requests()
+		items, err := eng.EditBatch(ctx, reqs, func(i int, msg string) {
+			stop.report(fmt.Sprintf("[任务 %d/%d] %s", i+1, total, msg))
+		})
+		stop.done()
+		if err != nil {
+			return nil, BatchResult{}, err
+		}
+		tasks := make([]batchTaskInfo, len(reqs))
+		for i, r := range reqs {
+			srcs := make([]string, len(r.Images))
+			for k, src := range r.Images {
+				srcs[k] = sourceLabel(src)
+			}
+			tasks[i] = batchTaskInfo{Prompt: strings.TrimSpace(r.Prompt), Sources: srcs}
+		}
+		_, limit := eng.Concurrency()
+		return batchResult("批量编辑", tasks, items, time.Since(start), limit, previewWanted(eng, in.IncludePreview), eng.Config().Defaults.PreviewMaxPx)
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -428,12 +528,7 @@ func (in EditInput) request() engine.EditRequest {
 // merged with the task's keys winning. Empty values left after that take the
 // configured defaults inside the engine.
 func (in BatchGenerateInput) requests() []engine.GenerateRequest {
-	pick := func(task, shared string) string {
-		if strings.TrimSpace(task) != "" {
-			return task
-		}
-		return shared
-	}
+	pick := pickString
 	out := make([]engine.GenerateRequest, len(in.Tasks))
 	for i, t := range in.Tasks {
 		n := t.N
@@ -450,6 +545,70 @@ func (in BatchGenerateInput) requests() []engine.GenerateRequest {
 		}
 	}
 	return out
+}
+
+// requests converts batch-edit arguments into one engine edit request per
+// task. prompt and the scalar parameters fall back from the task to the
+// batch's shared value like in batch_generate_images. Images and mask travel
+// together: a task with its own images uses only its own mask (a shared mask
+// is drawn for the shared images and would not fit others); a task without
+// images takes the shared images, and its own mask if set, else the shared
+// mask.
+func (in BatchEditInput) requests() []engine.EditRequest {
+	out := make([]engine.EditRequest, len(in.Tasks))
+	for i, t := range in.Tasks {
+		images, mask := in.Images, in.Mask
+		if len(t.Images) > 0 {
+			images, mask = t.Images, t.Mask
+		} else if strings.TrimSpace(t.Mask) != "" {
+			mask = t.Mask
+		}
+		n := t.N
+		if n == 0 {
+			n = in.N
+		}
+		out[i] = engine.EditRequest{
+			GenerateRequest: engine.GenerateRequest{
+				Prompt: pickString(t.Prompt, in.Prompt), Model: pickString(t.Model, in.Model), Provider: pickString(t.Provider, in.Provider),
+				Size: pickString(t.Size, in.Size), N: n, Quality: pickString(t.Quality, in.Quality), Seed: t.Seed,
+				ResponseFormat: in.ResponseFormat, OutputFormat: pickString(t.OutputFormat, in.OutputFormat),
+				Background: pickString(t.Background, in.Background), OutputDir: in.OutputDir,
+				FilenamePrefix: pickString(t.FilenamePrefix, in.FilenamePrefix), Extra: mergeExtra(in.Extra, t.Extra), Source: "mcp",
+			},
+			Images: images,
+			Mask:   mask,
+		}
+	}
+	return out
+}
+
+// pickString returns task unless it is blank, in which case it returns
+// shared: the fallback rule for every batch task parameter.
+//
+// task is the task's own value; shared is the batch-level value.
+func pickString(task, shared string) string {
+	if strings.TrimSpace(task) != "" {
+		return task
+	}
+	return shared
+}
+
+// sourceLabel shows a reference image source in results: absolute paths as
+// they are (a leading ~ counts, as in the engine), data URLs and bare base64
+// as a short placeholder so results never
+// echo large payloads back to the client.
+//
+// src is one entry of a task's images. It returns the display string.
+func sourceLabel(src string) string {
+	s := strings.TrimSpace(src)
+	switch {
+	case strings.HasPrefix(s, "data:"):
+		return "<data URL>"
+	case filepath.IsAbs(config.ExpandHome(s)):
+		return s
+	default:
+		return "<base64>"
+	}
 }
 
 // mergeExtra returns shared overlaid with task (task keys win), or nil when
@@ -521,22 +680,37 @@ func imageResult(res *engine.Result, preview bool, maxPx int) (*mcp.CallToolResu
 	return &mcp.CallToolResult{Content: content}, out, nil
 }
 
-// batchResult builds the batch tool result: a text summary with each task's
-// status and image paths (or its error), previews of the first image of each
-// successful task (at most maxBatchPreviews), and the structured output. When
-// every task failed the result is marked IsError so the client treats the
-// call as failed, while still carrying each task's error.
+// batchTaskInfo is what a batch result shows about each task's input: the
+// prompt it ran with and, for edits, its reference images (already passed
+// through sourceLabel).
+type batchTaskInfo struct {
+	Prompt  string
+	Sources []string
+}
+
+// batchResult builds a batch tool result: a text summary with each task's
+// status, reference images (for edits) and output paths (or its error),
+// previews of the first image of each successful task (at most
+// maxBatchPreviews), and the structured output. When every task failed the
+// result is marked IsError so the client treats the call as failed, while
+// still carrying each task's error.
 //
-// in is the batch arguments (for the prompts); items are the engine outcomes
-// in task order; elapsed is the whole batch's duration; limit is the
+// title names the batch in the summary ("批量生成" or "批量编辑"); tasks
+// describe each task's input, in task order; items are the engine outcomes in
+// the same order; elapsed is the whole batch's duration; limit is the
 // concurrency limit in force; preview says whether to attach previews; maxPx
 // is the preview's longer side.
-func batchResult(in BatchGenerateInput, items []engine.BatchItem, elapsed time.Duration, limit int, preview bool, maxPx int) (*mcp.CallToolResult, BatchResult, error) {
+func batchResult(title string, tasks []batchTaskInfo, items []engine.BatchItem, elapsed time.Duration, limit int, preview bool, maxPx int) (*mcp.CallToolResult, BatchResult, error) {
 	out := BatchResult{Items: make([]BatchItemOut, 0, len(items)), MaxConcurrency: limit, ElapsedMS: elapsed.Milliseconds()}
 	var body strings.Builder
 	var previews []mcp.Content
 	for i, it := range items {
-		item := BatchItemOut{Index: i, Prompt: strings.TrimSpace(in.Tasks[i].Prompt), ElapsedMS: it.Elapsed.Milliseconds()}
+		info := tasks[i]
+		item := BatchItemOut{Index: i, Prompt: info.Prompt, SourceImages: info.Sources, ElapsedMS: it.Elapsed.Milliseconds()}
+		sources := ""
+		if len(info.Sources) > 0 {
+			sources = "    参考图：" + strings.Join(info.Sources, "、") + "\n"
+		}
 		if it.Err != nil {
 			out.Failed++
 			item.Error = it.Err.Error()
@@ -544,7 +718,7 @@ func batchResult(in BatchGenerateInput, items []engine.BatchItem, elapsed time.D
 			if errors.As(it.Err, &f) {
 				item.Attempts = attemptsOut(f.Attempts)
 			}
-			fmt.Fprintf(&body, "[%d] 失败（%.1fs）：%s\n    prompt：%s\n", i+1, it.Elapsed.Seconds(), item.Error, oneLine(item.Prompt, 60))
+			fmt.Fprintf(&body, "[%d] 失败（%.1fs）：%s\n    prompt：%s\n%s", i+1, it.Elapsed.Seconds(), item.Error, oneLine(item.Prompt, 60), sources)
 			out.Items = append(out.Items, item)
 			continue
 		}
@@ -554,7 +728,7 @@ func batchResult(in BatchGenerateInput, items []engine.BatchItem, elapsed time.D
 		item.Model, item.Provider, item.RevisedPrompt, item.Seed = res.Model, res.Provider, res.RevisedPrompt, res.Seed
 		item.Images = imagesOut(res)
 		item.Attempts = attemptsOut(res.Attempts)
-		fmt.Fprintf(&body, "[%d] 成功：%d 张（模型 %s，服务商 %s，%.1fs）prompt：%s\n", i+1, len(res.Images), res.Model, res.Provider, it.Elapsed.Seconds(), oneLine(item.Prompt, 60))
+		fmt.Fprintf(&body, "[%d] 成功：%d 张（模型 %s，服务商 %s，%.1fs）prompt：%s\n%s", i+1, len(res.Images), res.Model, res.Provider, it.Elapsed.Seconds(), oneLine(item.Prompt, 60), sources)
 		for _, img := range res.Images {
 			fmt.Fprintf(&body, "    %s (%dx%d)\n", img.Path, img.Width, img.Height)
 		}
@@ -565,7 +739,7 @@ func batchResult(in BatchGenerateInput, items []engine.BatchItem, elapsed time.D
 		}
 		out.Items = append(out.Items, item)
 	}
-	head := fmt.Sprintf("批量生成完成：%d 个任务，成功 %d 个，失败 %d 个（总耗时 %.1fs，上游并发上限 %d）：\n", len(items), out.Succeeded, out.Failed, elapsed.Seconds(), limit)
+	head := fmt.Sprintf("%s完成：%d 个任务，成功 %d 个，失败 %d 个（总耗时 %.1fs，上游并发上限 %d）：\n", title, len(items), out.Succeeded, out.Failed, elapsed.Seconds(), limit)
 	content := append([]mcp.Content{&mcp.TextContent{Text: head + body.String()}}, previews...)
 	return &mcp.CallToolResult{Content: content, IsError: out.Succeeded == 0}, out, nil
 }

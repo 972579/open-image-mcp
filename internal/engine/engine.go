@@ -164,7 +164,28 @@ func (e *Engine) Generate(ctx context.Context, req GenerateRequest, progress Pro
 // ctx cancels the whole call; req holds the parameters and images; progress
 // receives status updates. Errors are as for Generate.
 func (e *Engine) Edit(ctx context.Context, req EditRequest, progress Progress) (*Result, error) {
-	cfg := e.Config()
+	j, err := e.planEdit(e.Config(), req, LoadInputImage)
+	if err != nil {
+		return nil, err
+	}
+	return e.run(ctx, j, progress)
+}
+
+// imageLoader loads one reference image or mask; LoadInputImage is the plain
+// one, and EditBatch passes a caching wrapper so an image shared by several
+// tasks is read once.
+type imageLoader func(src, name string) (imageapi.InputImage, error)
+
+// planEdit validates an image-to-image request against cfg, loads its
+// reference images and mask into memory, and resolves the providers that can
+// edit, without calling any upstream. Edit runs the job at once; EditBatch
+// plans every task first so a missing file or bad task rejects the batch
+// before anything is spent.
+//
+// cfg is the configuration the job will run with; req is the caller's request
+// (defaults are filled into a copy); load reads each image. It returns the
+// ready job, or a validation, image-loading or routing error.
+func (e *Engine) planEdit(cfg *config.Config, req EditRequest, load imageLoader) (*job, error) {
 	params, dir, prefix, err := e.prepare(cfg, &req.GenerateRequest)
 	if err != nil {
 		return nil, err
@@ -177,14 +198,14 @@ func (e *Engine) Edit(ctx context.Context, req EditRequest, progress Progress) (
 	}
 	edit := imageapi.EditParams{GenerateParams: params}
 	for i, src := range req.Images {
-		img, err := LoadInputImage(src, fmt.Sprintf("image-%d", i+1))
+		img, err := load(src, fmt.Sprintf("image-%d", i+1))
 		if err != nil {
 			return nil, err
 		}
 		edit.Images = append(edit.Images, img)
 	}
 	if strings.TrimSpace(req.Mask) != "" {
-		m, err := LoadInputImage(req.Mask, "mask")
+		m, err := load(req.Mask, "mask")
 		if err != nil {
 			return nil, err
 		}
@@ -197,10 +218,10 @@ func (e *Engine) Edit(ctx context.Context, req EditRequest, progress Progress) (
 	call := func(ctx context.Context, t imageapi.Target) (*imageapi.Response, imageapi.Debug, error) {
 		return e.api.Edit(ctx, t, edit)
 	}
-	return e.run(ctx, &job{
+	return &job{
 		cfg: cfg, cands: cands, call: call, dir: dir, prefix: prefix,
 		meta: storage.Meta{Kind: "edit", Source: req.Source, Prompt: req.Prompt, Size: params.Size},
-	}, progress)
+	}, nil
 }
 
 // planGenerate validates a text-to-image request against cfg and resolves its

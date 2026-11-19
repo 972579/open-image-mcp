@@ -3,12 +3,15 @@ package engine
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/972579/open-image-mcp/internal/config"
 	"github.com/972579/open-image-mcp/internal/storage"
 	"github.com/972579/open-image-mcp/internal/testutil"
 )
@@ -34,17 +37,30 @@ func (p *peakTracker) enter() {
 func (p *peakTracker) leave() { p.inflight.Add(-1) }
 
 // slowHandler answers every request after delay with one image, failing with
-// a 400 when the prompt contains "坏", and tracks concurrency in pt.
+// a 400 when the prompt (JSON or multipart) contains "坏", and tracks
+// concurrency in pt.
 func slowHandler(pt *peakTracker, delay time.Duration) func(int, testutil.Request) (int, any) {
 	return func(_ int, r testutil.Request) (int, any) {
 		pt.enter()
 		defer pt.leave()
 		time.Sleep(delay)
-		if p, _ := r.JSON["prompt"].(string); strings.Contains(p, "坏") {
+		if strings.Contains(requestPrompt(r), "坏") {
 			return 400, map[string]any{"error": map[string]any{"message": "prompt rejected"}}
 		}
 		return 200, testutil.B64Response(1)
 	}
+}
+
+// requestPrompt returns the prompt of a fake-upstream request, from the JSON
+// body (generations) or the multipart form (edits).
+func requestPrompt(r testutil.Request) string {
+	if p, ok := r.JSON["prompt"].(string); ok {
+		return p
+	}
+	if v := r.Form["prompt"]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
 }
 
 // TestBatchRunsConcurrentlyWithinLimit checks a batch runs its tasks in
@@ -141,6 +157,113 @@ func TestBatchValidatesBeforeCalling(t *testing.T) {
 	}
 	if _, err := e.GenerateBatch(context.Background(), make([]GenerateRequest, MaxBatchTasks+1), nil); err == nil {
 		t.Error("oversized batch accepted")
+	}
+}
+
+// writePNG saves a small PNG under dir and returns its absolute path, for edit
+// tests that pass reference images by path.
+func writePNG(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, testutil.PNG(8, 8), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestEditBatchRunsConcurrentlyWithinLimit checks an edit batch runs its tasks
+// in parallel under request.max_concurrency, sends each task's own reference
+// image to the edits endpoint, and records every result as an edit.
+func TestEditBatchRunsConcurrentlyWithinLimit(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	pt := &peakTracker{}
+	u.Handler = slowHandler(pt, 120*time.Millisecond)
+	e, dir := newEngine(t, prov("a", u, "openai", genModel))
+	cfg := e.Config().Clone()
+	cfg.Request.MaxConcurrency = 2
+	e.Reload(&cfg)
+
+	reqs := make([]EditRequest, 4)
+	for i := range reqs {
+		src := writePNG(t, dir, "src-"+string(rune('a'+i))+".png")
+		reqs[i] = EditRequest{GenerateRequest: GenerateRequest{Prompt: "批量编辑水彩"}, Images: []string{src}}
+	}
+	items, err := e.EditBatch(context.Background(), reqs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, it := range items {
+		if it.Err != nil || len(it.Result.Images) != 1 {
+			t.Fatalf("task %d: %+v %v", i, it.Result, it.Err)
+		}
+	}
+	if got := pt.peak.Load(); got != 2 {
+		t.Errorf("peak concurrent upstream requests = %d, want 2", got)
+	}
+	names := map[string]bool{}
+	for _, r := range u.Requests() {
+		if r.Path != "/v1/images/edits" || len(r.Files["image"]) != 1 {
+			t.Fatalf("not an edit request with one image: %+v", r)
+		}
+		names[r.Files["image"][0].Name] = true
+	}
+	if len(names) != 4 {
+		t.Errorf("upstream saw reference images %v, want 4 distinct", names)
+	}
+	_, recs, err := e.History(storage.Query{Keyword: "批量编辑水彩"})
+	if err != nil || len(recs) != 4 || recs[0].Kind != "edit" {
+		t.Errorf("history = %+v %v", recs, err)
+	}
+}
+
+// TestEditBatchValidatesBeforeCalling checks a missing reference image or a
+// model that cannot edit rejects the whole edit batch before any upstream
+// request.
+func TestEditBatchValidatesBeforeCalling(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	e, dir := newEngine(t, prov("a", u, "openai", genModel, config.Model{ID: "gen-only", Generate: true}))
+	src := writePNG(t, dir, "ok.png")
+	ok := EditRequest{GenerateRequest: GenerateRequest{Prompt: "改"}, Images: []string{src}}
+
+	missing := EditRequest{GenerateRequest: GenerateRequest{Prompt: "改"}, Images: []string{filepath.Join(dir, "nope.png")}}
+	if _, err := e.EditBatch(context.Background(), []EditRequest{ok, missing}, nil); err == nil || !strings.Contains(err.Error(), "第 2 个任务") {
+		t.Errorf("missing file: want error naming task 2, got %v", err)
+	}
+	genOnly := ok
+	genOnly.Model = "gen-only"
+	if _, err := e.EditBatch(context.Background(), []EditRequest{genOnly}, nil); err == nil || !strings.Contains(err.Error(), "第 1 个任务") {
+		t.Errorf("generation-only model: want error naming task 1, got %v", err)
+	}
+	if _, err := e.EditBatch(context.Background(), []EditRequest{{GenerateRequest: GenerateRequest{Prompt: "改"}}}, nil); err == nil {
+		t.Error("task without images accepted")
+	}
+	if n := len(u.Requests()); n != 0 {
+		t.Errorf("upstream got %d requests for rejected batches", n)
+	}
+}
+
+// TestCachedLoaderSharesImages checks the batch loader reads a reference
+// image used by several tasks once and hands back the same bytes, while a
+// different name (another position, or the mask) is loaded on its own.
+func TestCachedLoaderSharesImages(t *testing.T) {
+	src := writePNG(t, t.TempDir(), "shared.png")
+	load := cachedLoader()
+	a, err := load(src, "image-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := load(src, "image-1")
+	if &a.Data[0] != &b.Data[0] {
+		t.Error("same image loaded twice instead of shared")
+	}
+	m, _ := load(src, "mask")
+	if &m.Data[0] == &a.Data[0] {
+		t.Error("mask entry should be cached separately from the image entry")
+	}
+	if _, err := load(src+".missing", "image-1"); err == nil {
+		t.Error("missing file not reported")
 	}
 }
 

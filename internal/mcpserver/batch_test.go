@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,8 +17,8 @@ import (
 )
 
 // slowUpstream makes u answer each request after delay with one image (a 400
-// when the prompt contains "坏") and returns a counter of the highest number
-// of requests it served at once.
+// when the prompt, JSON or multipart, contains "坏") and returns a counter of
+// the highest number of requests it served at once.
 func slowUpstream(u *testutil.Upstream, delay time.Duration) *atomic.Int32 {
 	var inflight, peak atomic.Int32
 	u.Handler = func(_ int, r testutil.Request) (int, any) {
@@ -26,12 +27,24 @@ func slowUpstream(u *testutil.Upstream, delay time.Duration) *atomic.Int32 {
 		for old := peak.Load(); cur > old && !peak.CompareAndSwap(old, cur); old = peak.Load() {
 		}
 		time.Sleep(delay)
-		if p, _ := r.JSON["prompt"].(string); strings.Contains(p, "坏") {
+		if strings.Contains(promptOf(r), "坏") {
 			return 400, map[string]any{"error": map[string]any{"message": "prompt rejected"}}
 		}
 		return 200, testutil.B64Response(1)
 	}
 	return &peak
+}
+
+// promptOf returns a fake-upstream request's prompt from its JSON body
+// (generations) or multipart form (edits).
+func promptOf(r testutil.Request) string {
+	if p, ok := r.JSON["prompt"].(string); ok {
+		return p
+	}
+	if v := r.Form["prompt"]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
 }
 
 // TestParallelToolCalls checks that several generate_image calls sent at once
@@ -188,4 +201,103 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestBatchEditTool checks batch_edit_images through the MCP protocol: a task
+// without its own prompt or images takes the shared ones, a task with its own
+// images does not inherit the shared mask, tasks run in parallel against the
+// edits endpoint, one failing task does not fail the call, and an invalid
+// task (missing file, no prompt at all) rejects the batch before any request.
+func TestBatchEditTool(t *testing.T) {
+	u := testutil.NewUpstream()
+	defer u.Close()
+	peak := slowUpstream(u, 100*time.Millisecond)
+	cs := connectInMemory(t, testEngine(t, u))
+	ctx := context.Background()
+	dir := t.TempDir()
+	write := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, testutil.PNG(8, 8), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	a, b, mask, mask2 := write("a.png"), write("b.png"), write("mask.png"), write("mask2.png")
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "batch_edit_images", Arguments: map[string]any{
+		"prompt":          "统一改成水彩",
+		"images":          []string{a},
+		"mask":            mask,
+		"include_preview": false,
+		"tasks": []any{
+			map[string]any{},                                // shared prompt, images and mask
+			map[string]any{"images": []string{b}},           // own images: no shared mask
+			map[string]any{"prompt": "改成夜景", "mask": mask2}, // shared images, own mask
+			map[string]any{"prompt": "坏的指令"},                // fails upstream
+		},
+	}})
+	if err != nil || res.IsError {
+		t.Fatalf("batch_edit_images: %v %+v", err, res)
+	}
+	var out BatchResult
+	decode(t, res.StructuredContent, &out)
+	if out.Succeeded != 3 || out.Failed != 1 || out.Items[3].OK || out.Items[3].Error == "" {
+		t.Fatalf("batch summary wrong: %+v", out)
+	}
+	if out.Items[0].Prompt != "统一改成水彩" || out.Items[2].Prompt != "改成夜景" ||
+		len(out.Items[1].SourceImages) != 1 || out.Items[1].SourceImages[0] != b || out.Items[0].SourceImages[0] != a {
+		t.Errorf("items show wrong inputs: %+v", out.Items)
+	}
+	if got := peak.Load(); got != 4 {
+		t.Errorf("edit tasks did not run in parallel: peak %d", got)
+	}
+
+	// key: prompt + reference image name → mask file name ("" for none)
+	masks := map[string]string{}
+	for _, r := range u.Requests() {
+		if r.Path != "/v1/images/edits" || len(r.Files["image"]) != 1 {
+			t.Fatalf("not an edit with one image: %+v", r)
+		}
+		m := ""
+		if f := r.Files["mask"]; len(f) > 0 {
+			m = f[0].Name
+		}
+		masks[promptOf(r)+"|"+r.Files["image"][0].Name] = m
+	}
+	want := map[string]string{
+		"统一改成水彩|a.png": "mask.png",
+		"统一改成水彩|b.png": "",
+		"改成夜景|a.png":   "mask2.png",
+		"坏的指令|a.png":   "mask.png",
+	}
+	for k, v := range want {
+		if got, ok := masks[k]; !ok || got != v {
+			t.Errorf("request %s: mask %q (sent: %v), want %q", k, got, ok, v)
+		}
+	}
+	var text string
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			text += tc.Text
+		}
+	}
+	if !strings.Contains(text, "批量编辑完成") || !strings.Contains(text, "参考图："+b) || !strings.Contains(text, out.Items[0].Images[0].Path) {
+		t.Errorf("summary text: %q", text)
+	}
+
+	// Invalid tasks reject the whole batch before any upstream request.
+	before := len(u.Requests())
+	for name, args := range map[string]map[string]any{
+		"missing file": {"prompt": "改", "tasks": []any{map[string]any{"images": []string{a}}, map[string]any{"images": []string{filepath.Join(dir, "nope.png")}}}},
+		"no prompt":    {"images": []string{a}, "tasks": []any{map[string]any{"prompt": "有"}, map[string]any{}}},
+		"no images":    {"prompt": "改", "tasks": []any{map[string]any{}}},
+	} {
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "batch_edit_images", Arguments: args})
+		if err != nil || !res.IsError {
+			t.Errorf("%s: want tool error, got %v %+v", name, err, res)
+		}
+	}
+	if after := len(u.Requests()); after != before {
+		t.Errorf("rejected batches still sent %d requests", after-before)
+	}
 }
