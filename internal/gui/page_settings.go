@@ -22,6 +22,9 @@ type settingsForm struct {
 	prefix           string
 	previewPx        string
 	timeout, retries string
+	// concurrency is request.max_concurrency, the shared cap on upstream
+	// requests in flight.
+	concurrency string
 }
 
 // newSettingsForm fills the form from the draft.
@@ -32,10 +35,16 @@ func newSettingsForm(c *config.Config) settingsForm {
 		outputDir: c.Defaults.OutputDir, prefix: c.Defaults.FilenamePrefix,
 		previewPx: strconv.Itoa(c.Defaults.PreviewMaxPx),
 		timeout:   strconv.Itoa(int(c.Request.Timeout.Std().Seconds())), retries: strconv.Itoa(c.Request.MaxRetries),
+		concurrency: strconv.Itoa(c.Request.MaxConcurrency),
 	}
 }
 
-// apply parses the form into c, reporting the first malformed number.
+// apply parses the form into c, reporting the first malformed number. It
+// writes the draft only; saving it to disk and reloading the engine (which
+// applies a new concurrency limit at once) is the caller's job.
+//
+// c is the draft configuration to fill. It returns the first validation
+// error, or nil.
 func (f *settingsForm) apply(c *config.Config) error {
 	num := func(label, s string, lo, hi int) (int, error) {
 		v, err := strconv.Atoi(strings.TrimSpace(s))
@@ -60,6 +69,9 @@ func (f *settingsForm) apply(c *config.Config) error {
 	}
 	c.Request.Timeout = config.Duration(time.Duration(secs) * time.Second)
 	if c.Request.MaxRetries, err = num("重试次数", f.retries, 0, 5); err != nil {
+		return err
+	}
+	if c.Request.MaxConcurrency, err = num("最大并发数", f.concurrency, 1, config.MaxConcurrencyLimit); err != nil {
 		return err
 	}
 	c.Server.Host = strings.TrimSpace(f.host)
@@ -139,6 +151,13 @@ func (m *model) settingsPage(c ui.C) {
 				ui.Column(c).Grow(1).Children(func() {
 					field(c, "重试次数", "仅对网络错误、429、5xx 重试，指数退避。", func() {
 						ui.TextField(c, &f.retries, "重试次数", "1").FillWidth()
+					})
+				})
+				// Shared cap on in-flight upstream requests; the engine applies a
+				// saved change at once, queued calls included.
+				ui.Column(c).Grow(1).Children(func() {
+					field(c, "最大并发数", fmt.Sprintf("同时进行的上游请求上限（1-%d），所有调用和批量任务共享，超出的排队。", config.MaxConcurrencyLimit), func() {
+						ui.TextField(c, &f.concurrency, "最大并发数", "4").FillWidth()
 					})
 				})
 			})

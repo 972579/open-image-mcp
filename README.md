@@ -155,9 +155,12 @@ claude mcp add --transport http gen-image http://127.0.0.1:8765/mcp
 | 工具 | 必填参数 | 说明 |
 |---|---|---|
 | `generate_image` | `prompt` | 文生图。可选参数：`model`、`provider`、`size`、`n`(1-10)、`quality`、`style`、`seed`、`response_format`、`output_format`、`background`、`negative_prompt`、`output_dir`、`filename_prefix`、`include_preview`、`extra` |
+| `batch_generate_images` | `tasks` | 批量并发文生图。`tasks` 为 1-16 个任务，每个任务必填 `prompt`，可单独指定 `model`、`size`、`n`、`seed` 等；顶层的同名参数作为所有任务的公共值，`extra` 按键合并（任务优先）。各任务并发执行，某个任务失败不影响其他任务 |
 | `edit_image` | `prompt`、`images` | 图生图/编辑。`images` 可以是绝对路径、data URL 或 base64，最多 16 张。可选 `mask` 以及与生成相同的参数。模型需要在配置中勾选「编辑」 |
 | `list_models` | — | 列出可用模型、所属服务商以及支持生成还是编辑，可按 `provider`、`capability` 过滤 |
 | `list_generated_images` | — | 按时间倒序列出历史图片，可按 `limit`、`offset`、`model`、`keyword`、`since` 过滤 |
+
+**并发**：服务端会并行处理同时到达的多个工具调用，所有调用（包括批量任务和调试台）共享一个上游并发上限 `request.max_concurrency`（默认 4，设置页「最大并发数」，1-16），超出的请求排队等待，排队时间不计入请求超时。如果客户端是一个接一个地调用工具（不少 Agent 对会写文件的工具都这样做），多次 `generate_image` 仍会串行；要一次出多张不同内容的图，用 `batch_generate_images` 一次提交，服务端内部并发生成。批量结果按任务顺序列出每张图的路径和失败原因，附带每个成功任务第一张图的预览（最多 8 张）；全部任务都失败时整个调用标记为错误。
 
 返回内容包括三部分：一段文字说明（列出每张图的绝对路径）、最多 4 张 ≤512px 的 JPEG 预览，以及 `structuredContent`（含 `images[].path`、尺寸、模型、服务商、耗时、每次尝试的记录）。
 

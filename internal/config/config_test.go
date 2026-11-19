@@ -156,6 +156,29 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestMaxConcurrency checks request.max_concurrency defaults to 4, that a
+// missing or zero value is filled in by Normalize, and that out-of-range
+// values are rejected by Validate.
+func TestMaxConcurrency(t *testing.T) {
+	if got := Default().Request.MaxConcurrency; got != 4 {
+		t.Fatalf("default max_concurrency = %d, want 4", got)
+	}
+	c := Default()
+	c.Request.MaxConcurrency = 0
+	Normalize(&c)
+	if c.Request.MaxConcurrency != 4 {
+		t.Errorf("Normalize left max_concurrency = %d", c.Request.MaxConcurrency)
+	}
+	c.Request.MaxConcurrency = MaxConcurrencyLimit + 1
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_concurrency") {
+		t.Errorf("over-limit max_concurrency not rejected: %v", err)
+	}
+	c.Request.MaxConcurrency = MaxConcurrencyLimit
+	if err := c.Validate(); err != nil {
+		t.Errorf("max_concurrency at the limit rejected: %v", err)
+	}
+}
+
 // TestMask checks secret masking.
 func TestMask(t *testing.T) {
 	cases := map[string]string{
@@ -189,5 +212,8 @@ func TestExampleConfig(t *testing.T) {
 	}
 	if got := loaded.Effective.Providers[1].Models[1].Extra["num_inference_steps"]; got != 28 {
 		t.Errorf("model extra not parsed: %v", got)
+	}
+	if got := loaded.Effective.Request.MaxConcurrency; got != 4 {
+		t.Errorf("example max_concurrency = %d, want 4", got)
 	}
 }

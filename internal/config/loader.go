@@ -318,6 +318,9 @@ func Normalize(c *Config) {
 	if c.Request.MaxRetries < 0 {
 		c.Request.MaxRetries = 0
 	}
+	if c.Request.MaxConcurrency <= 0 {
+		c.Request.MaxConcurrency = d.Request.MaxConcurrency
+	}
 	for i := range c.Providers {
 		p := &c.Providers[i]
 		p.Name = strings.TrimSpace(p.Name)

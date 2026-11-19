@@ -21,13 +21,17 @@ import (
 )
 
 // Engine serves image requests from the current effective configuration. It is
-// safe for concurrent use; Reload swaps the configuration atomically so calls
-// already running finish with the configuration they started with.
+// safe for concurrent use: any number of calls may run at once, and at most
+// request.max_concurrency of their upstream requests are in flight at a time
+// (the rest queue). Reload swaps the configuration atomically so calls already
+// running finish with the configuration they started with.
 type Engine struct {
 	cfg   atomic.Pointer[config.Config]
 	api   *imageapi.Client
 	store *storage.Store
 	log   *slog.Logger
+	// slots bounds concurrent upstream requests across all calls.
+	slots *limiter
 	// sleep waits between retries; tests replace it to run instantly.
 	sleep func(ctx context.Context, d time.Duration) error
 }
@@ -38,7 +42,7 @@ func New(cfg *config.Config, api *imageapi.Client, store *storage.Store, log *sl
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	e := &Engine{api: api, store: store, log: log, sleep: sleepCtx}
+	e := &Engine{api: api, store: store, log: log, slots: newLimiter(cfg.Request.MaxConcurrency), sleep: sleepCtx}
 	e.Reload(cfg)
 	return e
 }
@@ -48,12 +52,19 @@ func (e *Engine) Config() *config.Config { return e.cfg.Load() }
 
 // Reload switches to a new effective configuration. Running calls keep the old
 // one; the next call uses the new one. No restart of the MCP server is needed.
+// The concurrency limit changes at once: queued requests re-check it, and
+// requests already in flight above a lowered limit are not interrupted.
 //
-// cfg is stored as a private clone.
+// cfg is stored as a private clone. There is no return value.
 func (e *Engine) Reload(cfg *config.Config) {
 	c := cfg.Clone()
 	e.cfg.Store(&c)
+	e.slots.setLimit(c.Request.MaxConcurrency)
 }
+
+// Concurrency reports how many upstream requests are in flight and the
+// current limit (request.max_concurrency), for status displays.
+func (e *Engine) Concurrency() (active, limit int) { return e.slots.stats() }
 
 // Store returns the image store, for the history listing.
 func (e *Engine) Store() *storage.Store { return e.store }
@@ -131,32 +142,27 @@ func (f *Failure) Error() string { return f.Err.Error() }
 func (f *Failure) Unwrap() error { return f.Err }
 
 // Generate runs a text-to-image call: validate, route, call with retry and
-// fallback, download URL results, save files and append history.
+// fallback, download URL results, save files and append history. It may run
+// concurrently with other calls; its upstream requests share the
+// request.max_concurrency slots and queue when all are taken.
 //
-// ctx cancels the whole call; req holds the parameters; progress receives
-// status updates. On failure the error is a *Failure wrapping an
-// *imageapi.Error (or a validation error).
+// ctx cancels the whole call, including the wait for a slot; req holds the
+// parameters; progress receives status updates. On failure the error is a
+// *Failure wrapping an *imageapi.Error (or a validation error).
 func (e *Engine) Generate(ctx context.Context, req GenerateRequest, progress Progress) (*Result, error) {
-	cfg := e.Config()
-	params, dir, prefix, err := e.prepare(cfg, &req)
+	j, err := e.planGenerate(e.Config(), req)
 	if err != nil {
 		return nil, err
 	}
-	cands, err := provider.Resolve(cfg, req.Model, req.Provider, provider.Generate)
-	if err != nil {
-		return nil, err
-	}
-	call := func(ctx context.Context, t imageapi.Target) (*imageapi.Response, imageapi.Debug, error) {
-		return e.api.Generate(ctx, t, params)
-	}
-	return e.run(ctx, cfg, cands, call, dir, prefix, storage.Meta{Kind: "generate", Source: req.Source, Prompt: req.Prompt, Size: params.Size}, progress)
+	return e.run(ctx, j, progress)
 }
 
 // Edit runs an image-to-image call. Reference images and the mask are loaded
-// from paths or decoded from base64 before routing.
+// from paths or decoded from base64 before routing. Like Generate it may run
+// concurrently and shares the upstream concurrency slots.
 //
 // ctx cancels the whole call; req holds the parameters and images; progress
-// receives status updates.
+// receives status updates. Errors are as for Generate.
 func (e *Engine) Edit(ctx context.Context, req EditRequest, progress Progress) (*Result, error) {
 	cfg := e.Config()
 	params, dir, prefix, err := e.prepare(cfg, &req.GenerateRequest)
@@ -191,7 +197,36 @@ func (e *Engine) Edit(ctx context.Context, req EditRequest, progress Progress) (
 	call := func(ctx context.Context, t imageapi.Target) (*imageapi.Response, imageapi.Debug, error) {
 		return e.api.Edit(ctx, t, edit)
 	}
-	return e.run(ctx, cfg, cands, call, dir, prefix, storage.Meta{Kind: "edit", Source: req.Source, Prompt: req.Prompt, Size: params.Size}, progress)
+	return e.run(ctx, &job{
+		cfg: cfg, cands: cands, call: call, dir: dir, prefix: prefix,
+		meta: storage.Meta{Kind: "edit", Source: req.Source, Prompt: req.Prompt, Size: params.Size},
+	}, progress)
+}
+
+// planGenerate validates a text-to-image request against cfg and resolves its
+// providers, without calling any upstream. Generate runs the job at once;
+// GenerateBatch plans every task first so one bad task rejects the batch
+// before anything is spent.
+//
+// cfg is the configuration the job will run with; req is the caller's request
+// (defaults are filled into a copy). It returns the ready job, or a
+// validation or routing error.
+func (e *Engine) planGenerate(cfg *config.Config, req GenerateRequest) (*job, error) {
+	params, dir, prefix, err := e.prepare(cfg, &req)
+	if err != nil {
+		return nil, err
+	}
+	cands, err := provider.Resolve(cfg, req.Model, req.Provider, provider.Generate)
+	if err != nil {
+		return nil, err
+	}
+	call := func(ctx context.Context, t imageapi.Target) (*imageapi.Response, imageapi.Debug, error) {
+		return e.api.Generate(ctx, t, params)
+	}
+	return &job{
+		cfg: cfg, cands: cands, call: call, dir: dir, prefix: prefix,
+		meta: storage.Meta{Kind: "generate", Source: req.Source, Prompt: req.Prompt, Size: params.Size},
+	}, nil
 }
 
 // Models lists configured models, optionally for one provider and capability
@@ -261,16 +296,38 @@ func (e *Engine) prepare(cfg *config.Config, req *GenerateRequest) (imageapi.Gen
 // callFunc performs one upstream request against a target.
 type callFunc func(ctx context.Context, t imageapi.Target) (*imageapi.Response, imageapi.Debug, error)
 
+// job is a validated call ready to run: the configuration it started with,
+// the providers to try in order, the upstream request, and where and how to
+// save the result.
+type job struct {
+	cfg    *config.Config
+	cands  []provider.Candidate
+	call   callFunc
+	dir    string
+	prefix string
+	meta   storage.Meta
+}
+
 // run tries each candidate in order. Retryable errors (network, timeout, 429,
 // 5xx) are retried on the same provider up to request.max_retries times with
 // exponential backoff; then, if the error allows fallback, the next candidate
 // is tried. The first success is downloaded, saved and returned.
-func (e *Engine) run(ctx context.Context, cfg *config.Config, cands []provider.Candidate, call callFunc, dir, prefix string, meta storage.Meta, progress Progress) (*Result, error) {
+//
+// Each attempt first takes one of the engine's concurrency slots and gives it
+// back as soon as the upstream answers, so backoff sleeps, downloads and
+// saving never hold a slot. The request timeout starts once the slot is held,
+// so time spent queueing does not count against it.
+//
+// ctx cancels the call (queueing included); j is the planned call; progress
+// receives status updates, including a note when the call has to queue. It
+// returns the result, or a *Failure with every attempt.
+func (e *Engine) run(ctx context.Context, j *job, progress Progress) (*Result, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(fmt.Sprintf(format, args...))
 		}
 	}
+	cfg, cands, call, dir, prefix, meta := j.cfg, j.cands, j.call, j.dir, j.prefix, j.meta
 	start := time.Now()
 	var attempts []Attempt
 	var lastErr error
@@ -287,11 +344,18 @@ func (e *Engine) run(ctx context.Context, cfg *config.Config, cands []provider.C
 					return nil, &Failure{Err: classifyCtx(err), Attempts: attempts, Debug: lastDebug}
 				}
 			}
+			err := e.slots.acquire(ctx, func(active, limit int) {
+				report("排队等待并发名额：已有 %d 个上游请求在进行（上限 %d）", active, limit)
+			})
+			if err != nil {
+				return nil, &Failure{Err: classifyCtx(err), Attempts: attempts, Debug: lastDebug}
+			}
 			report("正在请求 %s / %s", cand.Provider.Name, cand.Model.ID)
 			attemptStart := time.Now()
 			actx, cancel := context.WithTimeout(ctx, timeout)
 			resp, dbg, err := call(actx, target)
 			cancel()
+			e.slots.release()
 			lastDebug = dbg
 			att := Attempt{Provider: cand.Provider.Name, Model: cand.Model.ID, Elapsed: time.Since(attemptStart)}
 			if err == nil {

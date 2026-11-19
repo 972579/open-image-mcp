@@ -70,7 +70,15 @@ type RequestConfig struct {
 	Timeout    Duration `yaml:"timeout"`
 	MaxRetries int      `yaml:"max_retries"`
 	Fallback   bool     `yaml:"fallback"`
+	// MaxConcurrency caps how many upstream image requests run at the same
+	// time across every tool call, batch task and debug-console call; further
+	// requests wait for a free slot. Retries and fallbacks each take a slot
+	// only while their request is in flight.
+	MaxConcurrency int `yaml:"max_concurrency"`
 }
+
+// MaxConcurrencyLimit is the highest request.max_concurrency accepted.
+const MaxConcurrencyLimit = 16
 
 // Provider is one OpenAI-compatible service with its own key and models.
 type Provider struct {
@@ -199,9 +207,10 @@ func Default() Config {
 			PreviewMaxPx:   512,
 		},
 		Request: RequestConfig{
-			Timeout:    Duration(180 * time.Second),
-			MaxRetries: 1,
-			Fallback:   true,
+			Timeout:        Duration(180 * time.Second),
+			MaxRetries:     1,
+			Fallback:       true,
+			MaxConcurrency: 4,
 		},
 		Update: UpdateConfig{CheckOnStartup: true},
 	}
@@ -256,6 +265,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Defaults.N < 1 || c.Defaults.N > 10 {
 		problems = append(problems, "defaults.n 必须在 1-10 之间")
+	}
+	if c.Request.MaxConcurrency < 1 || c.Request.MaxConcurrency > MaxConcurrencyLimit {
+		problems = append(problems, fmt.Sprintf("request.max_concurrency 必须在 1-%d 之间", MaxConcurrencyLimit))
 	}
 	seen := map[string]bool{}
 	for i, p := range c.Providers {
