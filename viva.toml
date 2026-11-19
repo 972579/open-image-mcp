@@ -2,7 +2,7 @@
 [app]
 name = "GenImage MCP"            # 菜单栏名称，同时是 .app 名称
 id = "local.genimage.mcp"        # bundle identifier
-version = "1.0.2"
+version = "1.1.0"
 executable = "genimage"
 package = "."                    # main 包
 icon = "assets/icon.png"
